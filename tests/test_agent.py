@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 from datetime import datetime
@@ -155,3 +156,48 @@ def test_sa_phone():
     from app.server import sa_phone
     assert sa_phone("082 123 4567") == "27821234567"
     assert sa_phone("+27 82 123 4567") == "27821234567"
+
+
+# ---------- tracking + dashboard ----------
+def test_tracking_funnel_and_dashboard(monkeypatch):
+    import base64 as b64
+    from fastapi.testclient import TestClient
+    import app.server as srv
+    fake = FakeClaude([
+        [tu("d1", "search_stock", {"make": "Isuzu", "model": "D-Max", "part": "headlight", "side": "right"})],
+        [tb("Found it: Right Headlight R1,022. Want it?")],
+        [tu("d2", "make_checkout_link", {"variant_id": 49000000018})],
+        [tb("Here is your link.")],
+        [tb("Thanks for the photo, which vehicle is it for?")],
+        [tu("d3", "hand_over", {"reason": "customer asked for a person", "priority": "high"})],
+        [tb("Connecting you now.")],
+    ])
+    from pathlib import Path
+    from app.tracking import Tracker
+    a = Agent(client=fake, catalogue=cat, store=Store(), tracker=Tracker(Path(tempfile.mktemp(suffix=".db"))))
+    monkeypatch.setattr(srv, "_agent", a)
+    monkeypatch.setattr(srv, "TEST_PAGE_KEY", "k")
+    a.handle("t1", "D-Max right headlight")
+    a.handle("t1", "yes")
+    png = b64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
+    a.handle("t2", "", images=[{"data": png, "media_type": "image/png"}])
+    a.handle("t2", "just let me talk to someone")
+    # photo not kept in history as base64
+    assert "base64" not in json.dumps(a.store.load("t2").messages)
+    s = a.tracker.summary()
+    stages = {f["stage"]: f["count"] for f in s["funnel"]}
+    assert stages["started"] == 2 and stages["engaged"] == 2 and stages["checkout"] == 1
+    assert [r["id"] for r in s["needs_human"]] == ["t2"]
+    c = TestClient(srv.app)
+    assert "Open dashboard" in c.get("/dashboard").text
+    page = c.get("/dashboard?key=k").text
+    assert "Needs a human" in page and "customer asked for a person" in page
+    lead = c.get("/dashboard/lead/t2?key=k").text
+    photo = json.loads(a.tracker.get("t2")["photos"])[0]
+    assert f"/media/t2/{photo}" in lead
+    assert c.get(f"/media/t2/{photo}?key=k").status_code == 200
+    assert c.get(f"/media/t2/{photo}?key=bad").status_code == 403
+    r = c.post("/dashboard/status", data={"key": "k", "lead_id": "t2", "status": "Contacted", "note": "called"},
+               follow_redirects=False)
+    assert r.status_code == 303 and a.tracker.get("t2")["staff_status"] == "Contacted"
+    assert a.tracker.summary()["needs_human"] == []
