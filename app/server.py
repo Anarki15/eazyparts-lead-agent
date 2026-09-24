@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -80,6 +82,20 @@ def _cw(path: str, payload: dict, account_id: int):
     httpx.post(url, json=payload, headers={"api_access_token": CHATWOOT_BOT_TOKEN}, timeout=20)
 
 
+def webhook_sig() -> str:
+    return hashlib.sha256(CHATWOOT_BOT_TOKEN.encode()).hexdigest()[:16]
+
+
+@app.get("/setup/chatwoot-webhook-url", response_class=PlainTextResponse)
+def chatwoot_webhook_url(request: Request, key: str | None = None):
+    """Shows the exact webhook URL to paste into the Chatwoot bot (after CHATWOOT_BOT_TOKEN is set in Render)."""
+    _check_key(key)
+    if not CHATWOOT_BOT_TOKEN:
+        return "Set CHATWOOT_BOT_TOKEN in Render first, then reload this page."
+    base = str(request.base_url).rstrip("/").replace("http://", "https://")
+    return f"{base}/webhooks/chatwoot?sig={webhook_sig()}"
+
+
 def _download_image(url: str) -> dict | None:
     """Fetch a customer photo from the inbox and hand it to Claude as base64 (inbox links can be private)."""
     try:
@@ -130,7 +146,10 @@ def _process_chatwoot(event: dict):
 
 
 @app.post("/webhooks/chatwoot")
-async def chatwoot_webhook(request: Request, bg: BackgroundTasks):
+async def chatwoot_webhook(request: Request, bg: BackgroundTasks, sig: str = ""):
+    # The bot's webhook URL carries ?sig=<first 16 chars of sha256(bot token)> so strangers can't trigger the agent.
+    if CHATWOOT_BOT_TOKEN and not hmac.compare_digest(sig, webhook_sig()):
+        raise HTTPException(403)
     event = await request.json()
     if (event.get("event") == "message_created" and event.get("message_type") == "incoming"
             and (event.get("conversation") or {}).get("status") == "pending"):
