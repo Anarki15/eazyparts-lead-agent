@@ -185,7 +185,18 @@ async def test_chat(request: Request):
             "handover_reason": res.handover_reason, "lead_note": res.lead_note}
 
 
+LOGIN_PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>eAZyparts agent test</title><style>body{font:16px system-ui,sans-serif;background:#efeae2;display:grid;place-items:center;height:100vh;margin:0}
+form{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px #0002;display:flex;flex-direction:column;gap:12px;width:280px}
+input,button{font:inherit;padding:10px;border-radius:8px;border:1px solid #ccc}button{background:#008069;color:#fff;border:0;cursor:pointer}
+p{margin:0;color:#b00020;font-size:14px}</style></head><body><form method="get" action="/test">
+<strong>eAZyparts agent test</strong>__MSG__<input name="key" type="password" placeholder="Test page password" autofocus required>
+<button>Open test chat</button></form></body></html>"""
+
+
 @app.get("/test", response_class=HTMLResponse)
 def test_page(key: str | None = None):
-    _check_key(key)
+    if TEST_PAGE_KEY and key != TEST_PAGE_KEY:
+        msg = "<p>That password didn't match. Use the TEST_PAGE_KEY you set in Render.</p>" if key else ""
+        return HTMLResponse(LOGIN_PAGE.replace("__MSG__", msg), status_code=200 if not key else 403)
     return (Path(__file__).parent / "test_page.html").read_text().replace("__KEY__", json.dumps(key or ""))
