@@ -60,7 +60,39 @@ def apply_synonyms(text: str) -> str:
 
 
 def words(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9\-]+", apply_synonyms(text)) if w not in STOPWORDS}
+    out = set()
+    for w in re.findall(r"[a-z0-9\-]+", apply_synonyms(text)):
+        out.add(w)
+        if "-" in w:  # "c-class" also matches a customer typing "c class"
+            out.update(x for x in w.split("-") if x)
+    return {w for w in out if w not in STOPWORDS}
+
+
+# Words that turn a part into a smaller accessory of it ("headlight bracket", "mirror glass").
+# A listing with one of these only ranks high if the customer asked for it.
+ACCESSORY_WORDS = {"bracket", "brackets", "ballast", "unit", "module", "control", "bulb", "cover", "cap",
+                   "clip", "clips", "mount", "mounting", "bolt", "trim", "moulding", "molding", "washer",
+                   "switch", "relay", "harness", "wiring", "motor", "glass", "lens", "seal", "gasket",
+                   "support", "holder", "sensor", "adjuster", "tab", "repair", "kit", "cable", "hinge"}
+# Chassis codes used in listing titles: Mercedes W-codes (W204, W205) and BMW E/F/G codes (E90, F30, G20).
+# Kept narrow on purpose so model names like C200 or 320i are never mistaken for a chassis.
+CHASSIS_RE = re.compile(r"^(w)(\d{3})$|^([efg])(\d{2})$")
+
+
+def chassis_tokens(text: str) -> set[str]:
+    return {w for w in words(text) if CHASSIS_RE.match(w) and not re.fullmatch(r"(19|20)\d\d", w)}
+
+
+def chassis_conflict(title: str, chassis: set[str]) -> bool:
+    """True if the listing names a different chassis code of the same family (e.g. W204 when we want W205)."""
+    if not chassis:
+        return False
+    listed = chassis_tokens(title)
+    if not listed or listed & chassis:
+        return False
+    family = lambda c: "bmw" if c[0] in "efg" else c[0]  # BMW E/F/G codes are successive generations
+    fam = {family(c) for c in chassis}
+    return any(family(c) in fam for c in listed)
 
 
 @dataclass
@@ -245,7 +277,18 @@ class Catalogue:
 
     # ---------- search ----------
     def search(self, make: str = "", model: str = "", part: str = "", side: str = "",
-               year: int | None = None, part_number: str = "", vin: str = "", limit: int = 3) -> dict:
+               year: int | None = None, part_number: str = "", vin: str = "", chassis: str = "",
+               limit: int = 3) -> dict:
+        out = self._search(make, model, part, side, year, part_number, vin, chassis, limit)
+        if not out["found"] and side and not out.get("catalogue_unavailable"):
+            other = self._search(make, model, part, "", year, "", "", chassis, limit)
+            if other["found"]:
+                out["other_side_or_position"] = other["results"]
+                out["note"] = ("Nothing for the requested side/position, but these fit the same vehicle on another "
+                               "side/position. Only mention them if useful; never present them as the side asked for.")
+        return out
+
+    def _search(self, make, model, part, side, year, part_number, vin, chassis, limit) -> dict:
         prods = self.products()
         if not prods:
             return {"found": False, "results": [], "catalogue_unavailable": True,
@@ -263,7 +306,8 @@ class Catalogue:
         want_lr = q_side & SIDES
         want_fr = q_side & ENDS
         make_w = words(MAKE_ALIASES.get(apply_synonyms(make), make))
-        model_w = words(model)
+        want_chassis = chassis_tokens(f"{chassis} {model}")
+        model_w = words(model) - want_chassis  # chassis is checked separately (listings don't always name it)
         part_w = words(part) - SIDES - ENDS
 
         def side_ok(p: Product) -> bool:
@@ -295,21 +339,31 @@ class Catalogue:
                 continue
             if model_w and not model_w <= p.text_words:
                 continue
-            if not side_ok(p) or not year_ok(p):
+            if not side_ok(p) or not year_ok(p) or chassis_conflict(p.title, want_chassis):
                 continue
             part_hits = len(part_w & p.text_words)
             if part_w and part_hits == 0:
                 continue
             coverage = part_hits / max(len(part_w), 1)
-            score = coverage * 10 + (1 if year and year in p.years else 0)
-            scored.append((score, coverage, p))
+            extras = (words(p.title) & ACCESSORY_WORDS) - part_w
+            score = (coverage * 10 + (1 if year and year in p.years else 0)
+                     + (2 if want_chassis & words(p.title) else 0) - 6 * bool(extras))
+            scored.append((score, coverage, p, bool(extras)))
         scored.sort(key=lambda t: (-t[0], t[2].price))
-        results = []
-        for score, coverage, p in scored[:limit]:
-            conf = "medium" if coverage >= 0.99 else "low"
+
+        def summ(score, coverage, p):
+            conf = "medium" if coverage >= 0.99 and score >= 9 else "low"
             note = "text match" + ("" if not year or year in p.years else f", year not exact (listed {p.years or 'no year'}), confirm fitment")
-            results.append(p.summary(note, conf))
-        return {"found": bool(results), "results": results}
+            return p.summary(note, conf)
+
+        main = [summ(sc, cov, p) for sc, cov, p, acc in scored if not acc][:limit]
+        related = [summ(sc, cov, p) for sc, cov, p, acc in scored if acc][:limit]
+        out = {"found": bool(main), "results": main}
+        if related and not main:
+            out["related_items_only"] = related
+            out["note"] = ("We don't have the part itself, only related items (brackets, units, covers...). "
+                           "Treat the part as NOT in stock; mention these only if they could help.")
+        return out
 
 
 def checkout_link(variant_id: int, quantity: int = 1, lead_id: str | None = None) -> str:

@@ -31,7 +31,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "make": {"type": "string", "description": "e.g. Toyota"},
-                "model": {"type": "string", "description": "e.g. Hilux"},
+                "model": {"type": "string", "description": "Model family as listed, e.g. Hilux, C-Class, 3 Series, Polo (not the engine variant like C200 or 320i)"},
+                "chassis": {"type": "string", "description": "Chassis/generation code when the make uses them in listings: Mercedes W-code (W204, W205), BMW E/F/G code (E90, F30, G20). Work it out from model + year if you're confident."},
                 "year": {"type": "integer"},
                 "part": {"type": "string", "description": "e.g. headlight, front bumper, left door mirror"},
                 "side": {"type": "string", "description": "left/right and/or front/rear, if relevant"},
