@@ -1,0 +1,48 @@
+services:
+  - type: web
+    name: eazyparts-lead-agent
+    runtime: python
+    plan: starter
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: AGENT_DB
+        value: /var/data/conversations.db
+      - key: LEADS_CSV
+        value: /var/data/leads.csv
+      - key: CATALOGUE_SOURCE
+        value: live
+      - key: SHOPIFY_STORE_URL
+        value: https://www.eazyparts.co.za
+      - key: AGENT_MODEL
+        value: claude-haiku-4-5
+      - key: AGENT_ENABLED
+        value: "true"
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CHATWOOT_URL
+        value: https://app.chatwoot.com
+      - key: CHATWOOT_BOT_TOKEN
+        sync: false
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_PAGE_TOKEN
+        sync: false
+      - key: WA_PHONE_NUMBER_ID
+        sync: false
+      - key: WA_TOKEN
+        sync: false
+      - key: WA_OPENER_TEMPLATE
+        value: eazyparts_lead_opener
+      - key: SHEETS_WEBHOOK_URL
+        sync: false
+      - key: TEST_PAGE_KEY
+        sync: false
