@@ -17,6 +17,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 
 from .agent import DB_PATH, PHOTO_DIR, Agent, new_conversation_id
+from . import followups
 from .dashboard import render_dashboard, render_lead
 
 AGENT_ENABLED = os.getenv("AGENT_ENABLED", "true").lower() == "true"  # kill switch
@@ -67,6 +68,19 @@ def sa_phone(raw: str) -> str:
 def warm_catalogue():
     """Load the Shopify catalogue in the background and keep it fresh, so customers never wait for it."""
     agent().catalogue.start_background_refresh()
+    if CHATWOOT_BOT_TOKEN:
+        followups.start_loop(agent(), _send_followup)
+
+
+def _send_followup(lead: dict, text: str) -> bool:
+    account_id = lead.get("account_id") or os.getenv("CHATWOOT_ACCOUNT_ID", "")
+    conv_id = lead["id"].removeprefix("cw-")
+    if not account_id:
+        return False
+    r = httpx.post(f"{CHATWOOT_URL}/api/v1/accounts/{account_id}/conversations/{conv_id}/messages",
+                   json={"content": text, "message_type": "outgoing", "private": False},
+                   headers={"api_access_token": CHATWOOT_BOT_TOKEN}, timeout=20)
+    return r.status_code < 300
 
 
 @app.get("/health")
@@ -131,7 +145,7 @@ def _process_chatwoot(event: dict):
     images = [im for im in images if im]
     res = agent().handle(
         f"cw-{conv_id}", text=event.get("content") or "", images=images, channel=channel,
-        customer_name=sender.get("name", ""), phone=phone, context=context,
+        customer_name=sender.get("name", ""), phone=phone, context=context, account_id=str(account_id),
     )
     for text in res.replies:
         _cw(f"{conv_id}/messages", {"content": text, "message_type": "outgoing", "private": False}, account_id)
@@ -238,6 +252,24 @@ def test_page(key: str | None = None):
         msg = "<p>That password didn't match. Use the TEST_PAGE_KEY you set in Render.</p>" if key else ""
         return HTMLResponse(LOGIN_PAGE.replace("__MSG__", msg), status_code=200 if not key else 403)
     return (Path(__file__).parent / "test_page.html").read_text().replace("__KEY__", json.dumps(key or ""))
+
+
+# ---------- Shopify paid orders ----------
+SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
+
+
+@app.post("/webhooks/shopify-orders")
+async def shopify_orders(request: Request):
+    """Shopify Admin > Settings > Notifications > Webhooks > 'Order payment' (JSON) -> this URL."""
+    raw = await request.body()
+    if SHOPIFY_WEBHOOK_SECRET:
+        digest = base64.b64encode(hmac.new(SHOPIFY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).digest()).decode()
+        if not hmac.compare_digest(digest, request.headers.get("X-Shopify-Hmac-Sha256", "")):
+            raise HTTPException(401)
+    order = json.loads(raw or b"{}")
+    lead_id = agent().tracker.order_paid(order)
+    logging.getLogger("eazyparts").info("Shopify order %s matched lead %s", order.get("name"), lead_id)
+    return {"ok": True, "lead": lead_id}
 
 
 # ---------- Lead dashboard ----------

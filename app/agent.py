@@ -170,7 +170,7 @@ class Agent:
                 return {"error": "That product has just sold out. Apologise, then offer to search again or start a sourcing request."}
             conv.lead["outcome"] = "checkout link sent"
             url = checkout_link(p.variant_id, args.get("quantity", 1), conv.id)
-            self.tracker.checkout_sent(conv.id, p.title, url)
+            self.tracker.checkout_sent(conv.id, p.title, url, p.variant_id)
             return {"checkout_url": url, "title": p.title,
                     "price_zar": p.price, "note": "Delivery calculated at checkout, or collect in Bloemfontein."}
         if name == "save_lead_card":
@@ -195,11 +195,11 @@ class Agent:
     # ---------- main turn ----------
     def handle(self, conv_id: str, text: str = "", image_urls: list[str] | None = None,
                channel: str = "test", customer_name: str = "", phone: str = "", campaign: str = "",
-               context: str = "", images: list[dict] | None = None) -> TurnResult:
+               context: str = "", images: list[dict] | None = None, account_id: str = "") -> TurnResult:
         """images: [{"data": <base64>, "media_type": "image/jpeg"}] (photos the customer sent)."""
         conv = self.store.load(conv_id) or Conversation(id=conv_id, channel=channel, customer_name=customer_name,
                                                         phone=phone, campaign=campaign, context=context)
-        self.tracker.lead_started(conv_id, channel, customer_name, phone)
+        self.tracker.lead_started(conv_id, channel, customer_name, phone, account_id)
         photo_names = [self.save_photo(conv_id, im["data"], im.get("media_type", "image/jpeg"))
                        for im in images or []]
         self.tracker.customer_message(conv_id, text, photo_names)
@@ -251,6 +251,19 @@ class Agent:
                                 for c in m["content"]]
         self.store.save(conv)
         return result
+
+
+    def record_agent_text(self, conv_id: str, text: str) -> None:
+        """Add a message sent outside a normal turn (e.g. a follow-up) to the chat history, so the agent knows it said it."""
+        conv = self.store.load(conv_id)
+        if not conv:
+            return
+        block = {"type": "text", "text": f"[Automatic follow-up sent] {text}"}
+        if conv.messages and conv.messages[-1]["role"] == "assistant":
+            conv.messages[-1]["content"].append(block)
+        else:
+            conv.messages.append({"role": "assistant", "content": [block]})
+        self.store.save(conv)
 
 
 def trim_history(messages: list) -> list:

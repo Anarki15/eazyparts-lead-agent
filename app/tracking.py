@@ -5,6 +5,7 @@ Feeds the /dashboard page (drop-off funnel, 'needs a human' queue, 'gone quiet' 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -17,7 +18,14 @@ STAGES = [
     ("searched", "Vehicle + part known, stock searched"),
     ("found", "Part found in stock"),
     ("checkout", "Checkout link sent"),
+    ("paid", "Paid order on Shopify"),
 ]
+# Columns added after the first release; created automatically on existing databases.
+EXTRA_COLUMNS = {
+    "nudges": "INTEGER DEFAULT 0", "last_nudge_at": "REAL", "opted_out": "INTEGER DEFAULT 0",
+    "account_id": "TEXT DEFAULT ''", "paid_at": "REAL", "order_name": "TEXT DEFAULT ''",
+    "order_total": "REAL DEFAULT 0", "checkout_variants": "TEXT DEFAULT '[]'", "checkout_title": "TEXT DEFAULT ''",
+}
 STAGE_RANK = {s: i for i, (s, _) in enumerate(STAGES)}
 STAFF_STATUSES = ["New", "Contacted", "Quoted", "Won", "Lost"]
 
@@ -41,6 +49,10 @@ class Tracker:
             CREATE TABLE IF NOT EXISTS events (lead_id TEXT, ts REAL, kind TEXT, detail TEXT);
             CREATE INDEX IF NOT EXISTS ev_lead ON events(lead_id);
             """)
+            have = {r[1] for r in self.db.execute("PRAGMA table_info(leads)")}
+            for col, decl in EXTRA_COLUMNS.items():
+                if col not in have:
+                    self.db.execute(f"ALTER TABLE leads ADD COLUMN {col} {decl}")
             self.db.commit()
 
     # ---------- writes ----------
@@ -66,15 +78,15 @@ class Tracker:
             self._ensure(lead_id, stage=stage)
             self.event(lead_id, "stage", stage)
 
-    def lead_started(self, lead_id: str, channel: str, name: str = "", phone: str = ""):
+    def lead_started(self, lead_id: str, channel: str, name: str = "", phone: str = "", account_id: str = ""):
         if not self.get(lead_id):
-            self._ensure(lead_id, channel=channel, name=name, phone=phone)
+            self._ensure(lead_id, channel=channel, name=name, phone=phone, account_id=str(account_id or ""))
             self.event(lead_id, "started", channel)
 
     def customer_message(self, lead_id: str, text: str, photos: list[str] | None = None):
         row = self.get(lead_id)
         n = (row["customer_msgs"] if row else 0) + 1
-        fields = {"last_customer_at": time.time(), "customer_msgs": n}
+        fields = {"last_customer_at": time.time(), "customer_msgs": n, "nudges": 0}  # they're back: reset follow-ups
         if photos:
             fields["photos"] = json.dumps(json.loads(row["photos"] or "[]") + photos)
         self._ensure(lead_id, **fields)
@@ -98,12 +110,71 @@ class Tracker:
         if found:
             self.advance(lead_id, "found")
 
-    def checkout_sent(self, lead_id: str, title: str, url: str):
-        self.event(lead_id, "checkout", {"title": title, "url": url})
+    def checkout_sent(self, lead_id: str, title: str, url: str, variant_id: int | None = None):
+        row = self.get(lead_id)
+        variants = json.loads((row["checkout_variants"] if row else None) or "[]")
+        if variant_id and variant_id not in variants:
+            variants.append(variant_id)
+        self._ensure(lead_id, checkout_variants=json.dumps(variants), checkout_title=title[:200])
+        self.event(lead_id, "checkout", {"title": title, "url": url, "variant_id": variant_id})
         self.advance(lead_id, "checkout")
+
+    def nudge_sent(self, lead_id: str, text: str):
+        row = self.get(lead_id)
+        self._ensure(lead_id, nudges=(row["nudges"] or 0) + 1, last_nudge_at=time.time(), last_agent_at=time.time())
+        self.event(lead_id, "nudge", text[:1000])
+
+    def order_paid(self, order: dict) -> str | None:
+        """Match a Shopify order to a lead: lead_id cart attribute first, then phone, then product sent in chat."""
+        attrs = {a.get("name"): a.get("value") for a in order.get("note_attributes") or []}
+        lead_id = attrs.get("lead_id")
+        if not (lead_id and self.get(lead_id)):
+            lead_id = None
+            phones = {re.sub(r"\D", "", p or "")[-9:] for p in (
+                order.get("phone"), (order.get("customer") or {}).get("phone"),
+                (order.get("billing_address") or {}).get("phone"), (order.get("shipping_address") or {}).get("phone"))
+                if p and len(re.sub(r"\D", "", p)) >= 9}
+            variants = {li.get("variant_id") for li in order.get("line_items") or []}
+            since = time.time() - 14 * 86400
+            for r in self.leads_since(since):
+                if r["paid_at"]:
+                    continue
+                if phones and r["phone"] and r["phone"][-9:] in phones:
+                    lead_id = r["id"]
+                    break
+                if variants & set(json.loads(r["checkout_variants"] or "[]")):
+                    lead_id = r["id"]
+                    break
+        if not lead_id:
+            return None
+        self._ensure(lead_id, paid_at=time.time(), order_name=str(order.get("name") or order.get("order_number") or ""),
+                     order_total=float(order.get("total_price") or 0))
+        self.event(lead_id, "paid", {"order": order.get("name"), "total": order.get("total_price")})
+        self.advance(lead_id, "paid")
+        return lead_id
+
+    def due_for_nudge(self, first_after_h: float = 2, second_after_h: float = 20, window_h: float = 23.5):
+        """Leads the agent replied to, where the customer went quiet, still inside WhatsApp's 24h reply window."""
+        now = time.time()
+        out = []
+        for r in self.leads_since(now - 3 * 86400):
+            if r["handed_over"] or r["opted_out"] or r["paid_at"] or not r["id"].startswith("cw-"):
+                continue
+            last_c, last_a = r["last_customer_at"] or 0, r["last_agent_at"] or 0
+            if not last_c or last_a <= last_c:
+                continue  # customer spoke last: the agent is answering, nothing to chase
+            quiet_h = (now - last_c) / 3600
+            n = r["nudges"] or 0
+            if quiet_h >= window_h:
+                continue  # outside the free 24h window: a person should decide (needs a paid template)
+            if (n == 0 and quiet_h >= first_after_h) or (n == 1 and quiet_h >= second_after_h):
+                out.append(dict(r))
+        return out
 
     def handed_over(self, lead_id: str, reason: str, priority: str, card: dict):
         sourcing = 1 if "sourcing" in reason.lower() else 0
+        if "opt" in reason.lower() or "stop" in reason.lower():
+            self._ensure(lead_id, opted_out=1)
         vehicle = " ".join(str(card.get(k, "")) for k in ("make", "model", "year")).strip()
         fields = dict(handed_over=1, handover_reason=reason, priority=priority, handed_over_at=time.time(),
                       staff_status="New", sourcing=sourcing)
@@ -165,6 +236,9 @@ class Tracker:
         return {"days": days, "total": total, "funnel": funnel, "sourcing": sourcing,
                 "handovers": sum(r["handed_over"] for r in rows), "needs_human": needs_human,
                 "in_progress": in_progress, "gone_quiet": gone_quiet, "never_replied": never_replied,
+                "paid_orders": sum(1 for r in rows if r["paid_at"]),
+                "revenue": round(sum(r["order_total"] or 0 for r in rows if r["paid_at"]), 2),
+                "nudges": sum(r["nudges"] or 0 for r in rows),
                 "won": sum(1 for r in rows if r["staff_status"] == "Won"),
                 "lost": sum(1 for r in rows if r["staff_status"] == "Lost"),
                 "recent": [dict(r) for r in rows[:50]]}
