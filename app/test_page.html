@@ -13,33 +13,47 @@
   .note{align-self:stretch;background:#e7f0ff;font:12px/1.4 ui-monospace,monospace}
   form{display:flex;gap:8px;padding:10px;background:#f0f2f5;flex-wrap:wrap}
   input{flex:1;min-width:0;padding:10px 12px;border:0;border-radius:8px;font:inherit}
-  #img{flex-basis:100%}
+  #pick{background:#fff;border-radius:8px;padding:0 14px;display:flex;align-items:center;cursor:pointer;color:var(--accent);font-weight:600}
+  #preview{flex-basis:100%;font-size:13px;color:var(--muted)}#preview img{height:60px;border-radius:6px;vertical-align:middle;margin-right:8px}
+  .m img{max-width:220px;border-radius:6px;display:block;margin-top:4px}
   form button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:0 18px;font:inherit;cursor:pointer}
   a{color:var(--accent)}
 </style></head>
 <body>
-<header><strong>eAZyparts assistant — test chat</strong><button id="reset" type="button">New customer</button></header>
+<header><strong>eAZyparts assistant — test chat</strong><span><a id="dash" style="color:#fff;margin-right:12px" target="_blank">Dashboard</a><button id="reset" type="button">New customer</button></span></header>
 <div id="log"><div class="m sys">Play the customer. Try: "Hi, need a right headlight for a 2017 Isuzu D-Max"</div></div>
 <form id="f">
+  <label id="pick" title="Attach a photo">Photo<input id="file" type="file" accept="image/*" hidden></label>
   <input id="t" placeholder="Type a message" autocomplete="off">
   <button>Send</button>
-  <input id="img" placeholder="Optional: paste a public image URL to send as a photo">
+  <div id="preview"></div>
 </form>
 <script>
-const KEY = __KEY__; let conv = null;
-const log = document.getElementById('log');
-function add(cls, text){const d=document.createElement('div');d.className='m '+cls;
-  d.innerHTML=text.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])).replace(/(https?:\/\/\S+)/g,'<a href="$1" target="_blank">$1</a>');
+const KEY = __KEY__; let conv = null; let photo = null;
+document.getElementById('dash').href = '/dashboard?key=' + encodeURIComponent(KEY);
+const log = document.getElementById('log'), preview = document.getElementById('preview');
+function esc(t){return t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function add(cls, text, img){const d=document.createElement('div');d.className='m '+cls;
+  d.innerHTML=esc(text).replace(/(https?:\/\/\S+)/g,'<a href="$1" target="_blank">$1</a>');
+  if(img){const i=document.createElement('img');i.src=img;d.appendChild(i);}
   log.appendChild(d);log.scrollTop=log.scrollHeight;}
+// Shrink photos to max 1600px JPEG before sending (phone photos are huge)
+document.getElementById('file').onchange=e=>{const f=e.target.files[0]; if(!f) return;
+  const r=new FileReader(); r.onload=()=>{const im=new Image(); im.onload=()=>{const s=Math.min(1,1600/Math.max(im.width,im.height));
+    const c=document.createElement('canvas'); c.width=im.width*s; c.height=im.height*s; c.getContext('2d').drawImage(im,0,0,c.width,c.height);
+    photo=c.toDataURL('image/jpeg',0.85); preview.innerHTML='<img src="'+photo+'">Photo ready to send <a href="#" id="rm">remove</a>';
+    document.getElementById('rm').onclick=ev=>{ev.preventDefault();photo=null;preview.innerHTML='';};};
+    im.src=r.result;}; r.readAsDataURL(f); e.target.value='';};
 document.getElementById('reset').onclick=()=>{conv=null;log.innerHTML='';add('sys','New customer started.');};
 document.getElementById('f').onsubmit=async e=>{e.preventDefault();
-  const t=document.getElementById('t'), img=document.getElementById('img');
-  if(!t.value.trim() && !img.value.trim()) return;
-  add('me', t.value + (img.value ? '\n[photo] '+img.value : '')); const body={conv_id:conv,text:t.value,image_url:img.value||null,key:KEY};
-  t.value='';img.value='';add('sys','…');
+  const t=document.getElementById('t');
+  if(!t.value.trim() && !photo) return;
+  add('me', t.value, photo); const body={conv_id:conv,text:t.value,image:photo,key:KEY};
+  t.value=''; photo=null; preview.innerHTML=''; add('sys','…');
   try{const r=await fetch('/test/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const j=await r.json(); log.lastChild.remove(); conv=j.conv_id;
-    (j.replies||[]).forEach(x=>add('bot',x));
+    const j=await r.json(); log.lastChild.remove();
+    if(!r.ok){add('sys','Error: '+(j.detail||r.status));return;}
+    conv=j.conv_id; (j.replies||[]).forEach(x=>add('bot',x));
     if(j.handed_over){add('sys','Handed over to staff: '+j.handover_reason); if(j.lead_note) add('note', j.lead_note);}
   }catch(err){log.lastChild.remove();add('sys','Error: '+err);}
 };

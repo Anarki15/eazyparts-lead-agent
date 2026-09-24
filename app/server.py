@@ -1,6 +1,7 @@
 """Web service: Chatwoot agent-bot webhook, Meta lead-form webhook, and a test chat page."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -11,9 +12,10 @@ from pathlib import Path
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 
-from .agent import DB_PATH, Agent, new_conversation_id
+from .agent import DB_PATH, PHOTO_DIR, Agent, new_conversation_id
+from .dashboard import render_dashboard, render_lead
 
 AGENT_ENABLED = os.getenv("AGENT_ENABLED", "true").lower() == "true"  # kill switch
 
@@ -78,6 +80,19 @@ def _cw(path: str, payload: dict, account_id: int):
     httpx.post(url, json=payload, headers={"api_access_token": CHATWOOT_BOT_TOKEN}, timeout=20)
 
 
+def _download_image(url: str) -> dict | None:
+    """Fetch a customer photo from the inbox and hand it to Claude as base64 (inbox links can be private)."""
+    try:
+        r = httpx.get(url, timeout=30, follow_redirects=True, headers={"api_access_token": CHATWOOT_BOT_TOKEN})
+        r.raise_for_status()
+        mt = r.headers.get("content-type", "image/jpeg").split(";")[0]
+        if mt not in ("image/jpeg", "image/png", "image/webp", "image/gif") or len(r.content) > 5_000_000:
+            return None
+        return {"data": base64.b64encode(r.content).decode(), "media_type": mt}
+    except httpx.HTTPError:
+        return None
+
+
 def _process_chatwoot(event: dict):
     conv = event["conversation"]
     account_id = event["account"]["id"]
@@ -96,9 +111,10 @@ def _process_chatwoot(event: dict):
         if row:
             context = row[0]
 
-    images = [a["data_url"] for a in event.get("attachments") or [] if a.get("file_type") == "image"]
+    images = [_download_image(a["data_url"]) for a in event.get("attachments") or [] if a.get("file_type") == "image"]
+    images = [im for im in images if im]
     res = agent().handle(
-        f"cw-{conv_id}", text=event.get("content") or "", image_urls=images, channel=channel,
+        f"cw-{conv_id}", text=event.get("content") or "", images=images, channel=channel,
         customer_name=sender.get("name", ""), phone=phone, context=context,
     )
     for text in res.replies:
@@ -178,8 +194,11 @@ async def test_chat(request: Request):
     body = await request.json()
     _check_key(body.get("key"))
     conv_id = body.get("conv_id") or new_conversation_id()
-    images = [body["image_url"]] if body.get("image_url") else []
-    res = agent().handle(f"test-{conv_id}", text=body.get("text", ""), image_urls=images, channel="Test page",
+    images = []
+    if body.get("image"):  # data URL from the photo button: "data:image/jpeg;base64,...."
+        head, _, data = body["image"].partition(",")
+        images = [{"data": data, "media_type": head[5:].split(";")[0] or "image/jpeg"}]
+    res = agent().handle(f"test-{conv_id}", text=body.get("text", ""), images=images, channel="Test page",
                          customer_name=body.get("name", ""))
     return {"conv_id": conv_id, "replies": res.replies, "handed_over": res.handed_over,
             "handover_reason": res.handover_reason, "lead_note": res.lead_note}
@@ -200,3 +219,41 @@ def test_page(key: str | None = None):
         msg = "<p>That password didn't match. Use the TEST_PAGE_KEY you set in Render.</p>" if key else ""
         return HTMLResponse(LOGIN_PAGE.replace("__MSG__", msg), status_code=200 if not key else 403)
     return (Path(__file__).parent / "test_page.html").read_text().replace("__KEY__", json.dumps(key or ""))
+
+
+# ---------- Lead dashboard ----------
+def _dash_key(key: str | None) -> str:
+    want = os.getenv("DASHBOARD_KEY") or TEST_PAGE_KEY
+    if want and key != want:
+        raise HTTPException(403, "Open /test and enter the password first, or add ?key=... to the URL")
+    return key or ""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(key: str | None = None, days: int = 7):
+    if (os.getenv("DASHBOARD_KEY") or TEST_PAGE_KEY) and not key:
+        return HTMLResponse(LOGIN_PAGE.replace('action="/test"', 'action="/dashboard"').replace("Open test chat", "Open dashboard").replace("__MSG__", ""))
+    return render_dashboard(agent().tracker, _dash_key(key), days=max(1, min(days, 90)))
+
+
+@app.get("/dashboard/lead/{lead_id}", response_class=HTMLResponse)
+def dashboard_lead(lead_id: str, key: str | None = None):
+    return render_lead(agent().tracker, lead_id, _dash_key(key))
+
+
+@app.post("/dashboard/status")
+async def dashboard_status(request: Request):
+    form = await request.form()
+    key = _dash_key(form.get("key"))
+    agent().tracker.set_staff_status(form["lead_id"], form["status"], form.get("note", ""))
+    back = request.headers.get("referer") or f"/dashboard?key={key}"
+    return RedirectResponse(back, status_code=303)
+
+
+@app.get("/media/{lead_id}/{name}")
+def media(lead_id: str, name: str, key: str | None = None):
+    _dash_key(key)
+    path = (PHOTO_DIR / lead_id / name).resolve()
+    if PHOTO_DIR.resolve() not in path.parents or not path.exists():
+        raise HTTPException(404)
+    return FileResponse(path)

@@ -1,10 +1,12 @@
 """The agent brain: one Claude tool-use loop per customer message."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,11 +14,14 @@ from pathlib import Path
 from .catalogue import Catalogue, checkout_link
 from .leads import format_card, save_lead
 from .prompt import build_system_prompt
+from .tracking import Tracker
 
 MODEL = os.getenv("AGENT_MODEL", "claude-haiku-4-5")
 MAX_TOOL_ROUNDS = 6
 MAX_HISTORY = 40  # messages kept per conversation
 DB_PATH = Path(os.getenv("AGENT_DB", Path(__file__).resolve().parent.parent / "data" / "conversations.db"))
+PHOTO_DIR = DB_PATH.parent / "photos"
+IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
 
 TOOLS = [
     {
@@ -124,13 +129,26 @@ class TurnResult:
 
 
 class Agent:
-    def __init__(self, client=None, catalogue: Catalogue | None = None, store: Store | None = None):
+    def __init__(self, client=None, catalogue: Catalogue | None = None, store: Store | None = None,
+                 tracker: Tracker | None = None):
         if client is None:
             import anthropic
             client = anthropic.Anthropic()
         self.client = client
         self.catalogue = catalogue or Catalogue()
         self.store = store or Store()
+        self.tracker = tracker or Tracker(self.store_path().parent / "tracking.db")
+
+    def store_path(self) -> Path:
+        return DB_PATH
+
+    def save_photo(self, conv_id: str, data_b64: str, media_type: str) -> str:
+        """Keep a copy of every customer photo so staff can see it on the dashboard. Returns the file name."""
+        folder = PHOTO_DIR / conv_id
+        folder.mkdir(parents=True, exist_ok=True)
+        name = f"{int(time.time() * 1000)}.{IMAGE_TYPES.get(media_type, 'jpg')}"
+        (folder / name).write_bytes(base64.b64decode(data_b64))
+        return name
 
     # ---------- tools ----------
     def _run_tool(self, conv: Conversation, name: str, args: dict, result: TurnResult) -> dict:
@@ -140,6 +158,8 @@ class Agent:
             conv.lead["stock_result"] = (
                 "; ".join(r["title"] for r in out["results"]) if out["found"] else f"no match for {args}"
             )
+            if not out.get("catalogue_unavailable"):
+                self.tracker.stock_search(conv.id, args, out["found"], conv.lead["stock_result"])
             return out
         if name == "get_product":
             p = self.catalogue.get(args["variant_id"])
@@ -149,7 +169,9 @@ class Agent:
             if not p or not self.catalogue.still_available(p):
                 return {"error": "That product has just sold out. Apologise, then offer to search again or start a sourcing request."}
             conv.lead["outcome"] = "checkout link sent"
-            return {"checkout_url": checkout_link(p.variant_id, args.get("quantity", 1), conv.id), "title": p.title,
+            url = checkout_link(p.variant_id, args.get("quantity", 1), conv.id)
+            self.tracker.checkout_sent(conv.id, p.title, url)
+            return {"checkout_url": url, "title": p.title,
                     "price_zar": p.price, "note": "Delivery calculated at checkout, or collect in Bloemfontein."}
         if name == "save_lead_card":
             conv.lead.update({k: v for k, v in args.items() if v})
@@ -166,21 +188,30 @@ class Agent:
                     "outcome": conv.lead.get("outcome") or ("sourcing request" if "sourcing" in args["reason"] else "handover")}
             saved = save_lead(card)
             result.lead_note = format_card(saved["row"])
+            self.tracker.handed_over(conv.id, args["reason"], args["priority"], card)
             return {"ok": True, "google_sheet": saved["google_sheet"]}
         return {"error": f"unknown tool {name}"}
 
     # ---------- main turn ----------
     def handle(self, conv_id: str, text: str = "", image_urls: list[str] | None = None,
                channel: str = "test", customer_name: str = "", phone: str = "", campaign: str = "",
-               context: str = "") -> TurnResult:
+               context: str = "", images: list[dict] | None = None) -> TurnResult:
+        """images: [{"data": <base64>, "media_type": "image/jpeg"}] (photos the customer sent)."""
         conv = self.store.load(conv_id) or Conversation(id=conv_id, channel=channel, customer_name=customer_name,
                                                         phone=phone, campaign=campaign, context=context)
+        self.tracker.lead_started(conv_id, channel, customer_name, phone)
+        photo_names = [self.save_photo(conv_id, im["data"], im.get("media_type", "image/jpeg"))
+                       for im in images or []]
+        self.tracker.customer_message(conv_id, text, photo_names)
         if conv.handed_over:
             return TurnResult(replies=[], handed_over=True)  # staff are handling it
 
         content = []
         for url in image_urls or []:
             content.append({"type": "image", "source": {"type": "url", "url": url}})
+        for im in images or []:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": im.get("media_type", "image/jpeg"),
+                                                        "data": im["data"]}})
         content.append({"type": "text", "text": text or "(customer sent a photo)"})
         conv.messages.append({"role": "user", "content": content})
 
@@ -201,6 +232,8 @@ class Agent:
             conv.messages.append({"role": "assistant", "content": blocks})
             texts = [b["text"] for b in blocks if b["type"] == "text" and b["text"].strip()]
             result.replies.extend(texts)
+            for t in texts:
+                self.tracker.agent_message(conv.id, t)
             tool_uses = [b for b in blocks if b["type"] == "tool_use"]
             if not tool_uses:
                 break
@@ -210,6 +243,12 @@ class Agent:
                 tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": json.dumps(out)})
             conv.messages.append({"role": "user", "content": tool_results})
 
+        # Photos are big: once Claude has looked at them, keep only a note in the stored history.
+        for m in conv.messages:
+            if m["role"] == "user" and isinstance(m["content"], list):
+                m["content"] = [c if c.get("type") != "image" or c["source"].get("type") != "base64"
+                                else {"type": "text", "text": "[customer photo - already viewed above; details are in your replies/lead card]"}
+                                for c in m["content"]]
         self.store.save(conv)
         return result
 
