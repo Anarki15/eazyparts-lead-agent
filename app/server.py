@@ -77,10 +77,8 @@ def _send_followup(lead: dict, text: str) -> bool:
     conv_id = lead["id"].removeprefix("cw-")
     if not account_id:
         return False
-    r = httpx.post(f"{CHATWOOT_URL}/api/v1/accounts/{account_id}/conversations/{conv_id}/messages",
-                   json={"content": text, "message_type": "outgoing", "private": False},
-                   headers={"api_access_token": CHATWOOT_BOT_TOKEN}, timeout=20)
-    return r.status_code < 300
+    r = _cw(f"{conv_id}/messages", {"content": text, "message_type": "outgoing", "private": False}, account_id)
+    return r is not None and r.status_code < 300
 
 
 @app.get("/health")
@@ -91,9 +89,21 @@ def health():
 
 
 # ---------- Chatwoot agent bot ----------
+CW_HEADERS = {"User-Agent": "eAZyparts-lead-agent/1.0 (+https://eazyparts-lead-agent.onrender.com)",
+              "Accept": "application/json"}
+
+
 def _cw(path: str, payload: dict, account_id: int):
+    """POST to the Chatwoot API as the agent bot. Logs the reason if Chatwoot refuses."""
     url = f"{CHATWOOT_URL}/api/v1/accounts/{account_id}/conversations/{path}"
-    httpx.post(url, json=payload, headers={"api_access_token": CHATWOOT_BOT_TOKEN}, timeout=20)
+    try:
+        r = httpx.post(url, json=payload, headers={**CW_HEADERS, "api_access_token": CHATWOOT_BOT_TOKEN}, timeout=20)
+    except httpx.HTTPError as e:
+        logging.getLogger("eazyparts").warning("Chatwoot %s failed: %s", path, e)
+        return None
+    if r.status_code >= 300:
+        logging.getLogger("eazyparts").warning("Chatwoot %s -> %s: %s", path, r.status_code, r.text[:300].replace("\n", " "))
+    return r
 
 
 def webhook_sig() -> str:
@@ -113,7 +123,7 @@ def chatwoot_webhook_url(request: Request, key: str | None = None):
 def _download_image(url: str) -> dict | None:
     """Fetch a customer photo from the inbox and hand it to Claude as base64 (inbox links can be private)."""
     try:
-        r = httpx.get(url, timeout=30, follow_redirects=True, headers={"api_access_token": CHATWOOT_BOT_TOKEN})
+        r = httpx.get(url, timeout=30, follow_redirects=True, headers={**CW_HEADERS, "api_access_token": CHATWOOT_BOT_TOKEN})
         r.raise_for_status()
         mt = r.headers.get("content-type", "image/jpeg").split(";")[0]
         if mt not in ("image/jpeg", "image/png", "image/webp", "image/gif") or len(r.content) > 5_000_000:
