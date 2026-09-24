@@ -24,8 +24,9 @@ import httpx
 log = logging.getLogger("eazyparts.catalogue")
 STORE_URL = os.getenv("SHOPIFY_STORE_URL", "https://www.eazyparts.co.za").rstrip("/")
 SAMPLE_FILE = Path(__file__).resolve().parent.parent / "data" / "sample_products.json"
-CACHE_SECONDS = int(os.getenv("CATALOGUE_CACHE_SECONDS", "1800"))
+CACHE_SECONDS = int(os.getenv("CATALOGUE_CACHE_SECONDS", "7200"))
 YEAR_WINDOW = 3
+KEEP_FIELDS = ("id", "title", "handle", "product_type", "vendor", "tags", "variants", "images")
 PAGE_PAUSE = float(os.getenv("CATALOGUE_PAGE_PAUSE", "2"))
 CACHE_FILE = Path(os.getenv("CATALOGUE_CACHE_FILE", Path(os.getenv("AGENT_DB", "data/x")).parent / "catalogue_cache.json"))
 
@@ -159,7 +160,7 @@ class Catalogue:
                           headers={"User-Agent": "Mozilla/5.0 (compatible; eazyparts-lead-agent/1.0)"}) as c:
             while True:
                 batch = self._get_page(c, page)
-                out.extend(batch)
+                out.extend({k: x.get(k) for k in KEEP_FIELDS} for x in batch)  # drop descriptions etc. to save memory
                 self.status["pages"] = page
                 if len(batch) < 250 or page >= 100:
                     break
