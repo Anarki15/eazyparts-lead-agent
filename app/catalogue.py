@@ -26,6 +26,8 @@ STORE_URL = os.getenv("SHOPIFY_STORE_URL", "https://www.eazyparts.co.za").rstrip
 SAMPLE_FILE = Path(__file__).resolve().parent.parent / "data" / "sample_products.json"
 CACHE_SECONDS = int(os.getenv("CATALOGUE_CACHE_SECONDS", "1800"))
 YEAR_WINDOW = 3
+PAGE_PAUSE = float(os.getenv("CATALOGUE_PAGE_PAUSE", "2"))
+CACHE_FILE = Path(os.getenv("CATALOGUE_CACHE_FILE", Path(os.getenv("AGENT_DB", "data/x")).parent / "catalogue_cache.json"))
 
 # Words customers use -> words in eAZyparts titles/tags
 SYNONYMS = {
@@ -138,10 +140,13 @@ class Catalogue:
 
     # ---------- loading ----------
     def _get_page(self, c: httpx.Client, page: int) -> list[dict]:
-        for attempt in range(4):
+        for attempt in range(8):
             r = c.get(f"{STORE_URL}/products.json", params={"limit": 250, "page": page})
-            if r.status_code in (429, 430, 503):  # Shopify throttling: back off and retry
-                time.sleep(2 * (attempt + 1))
+            if r.status_code in (429, 430, 503):  # Shopify throttling: wait as long as it asks, then retry
+                wait = float(r.headers.get("Retry-After") or 0) or min(60, 5 * 2 ** attempt)
+                self.status["last_error"] = f"page {page}: HTTP {r.status_code}, waiting {wait:.0f}s"
+                log.info("Shopify throttled page %s (HTTP %s), waiting %ss", page, r.status_code, wait)
+                time.sleep(wait)
                 continue
             r.raise_for_status()
             return r.json().get("products", [])
@@ -159,31 +164,66 @@ class Catalogue:
                 if len(batch) < 250 or page >= 100:
                     break
                 page += 1
+                time.sleep(PAGE_PAUSE)  # be gentle with the store
         return out
 
-    def products(self) -> list[Product]:
-        if self._products and time.time() - self._loaded_at < CACHE_SECONDS:
-            return self._products
-        with self._lock:  # only one load at a time; others wait and reuse it
-            if self._products and time.time() - self._loaded_at < CACHE_SECONDS:
-                return self._products
+    def _set(self, raw: list[dict], loaded_at: float) -> None:
+        self._products = [p for p in (Product.from_shopify(x) for x in raw) if p and p.available]
+        self._loaded_at = loaded_at
+
+    def _load_disk_copy(self) -> bool:
+        try:
+            data = json.loads(CACHE_FILE.read_text())
+            self._set(data["products"], data["saved_at"])
+            self.status.update(state="loaded (saved copy)", products=len(self._products))
+            log.info("catalogue: using saved copy with %s sellable products", len(self._products))
+            return True
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def refresh(self) -> None:
+        """Download the whole catalogue from Shopify (slow: ~20 pages). Safe to call from a background thread."""
+        if self.source != "live":
+            self._set(json.loads(SAMPLE_FILE.read_text())["products"], time.time())
+            self.status.update(state="loaded", products=len(self._products))
+            return
+        if not self._lock.acquire(blocking=False):
+            return  # a refresh is already running
+        try:
             t0 = time.time()
-            self.status["state"] = "loading"
-            try:
-                raw = self._fetch_live() if self.source == "live" else json.loads(SAMPLE_FILE.read_text())["products"]
-            except (httpx.HTTPError, ValueError) as e:
-                self.status.update(state="error", last_error=f"{type(e).__name__}: {e}"[:300])
-                log.warning("catalogue load failed: %s", e)
-                if self._products:  # store unreachable: keep using the last good copy
-                    return self._products
-                raise
-            self._products = [p for p in (Product.from_shopify(x) for x in raw) if p and p.available]
-            self._loaded_at = time.time()
+            self.status.update(state="loading" if not self._products else "refreshing", pages=0)
+            raw = self._fetch_live()
+            self._set(raw, time.time())
             self.status.update(state="loaded", last_error=None, load_seconds=round(time.time() - t0, 1),
                                products=len(self._products), raw_products=len(raw))
             log.info("catalogue loaded: %s sellable of %s products in %ss", len(self._products), len(raw),
                      self.status["load_seconds"])
-            return self._products
+            try:
+                CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                CACHE_FILE.write_text(json.dumps({"saved_at": self._loaded_at, "products": raw}))
+            except OSError as e:
+                log.warning("could not save catalogue copy: %s", e)
+        except (httpx.HTTPError, ValueError) as e:
+            self.status.update(state="error" if not self._products else "loaded (refresh failed)",
+                               last_error=f"{type(e).__name__}: {e}"[:300])
+            log.warning("catalogue load failed: %s", e)
+        finally:
+            self._lock.release()
+
+    def start_background_refresh(self) -> None:
+        """Use the saved copy straight away (if any), then keep the catalogue fresh in the background."""
+        def loop():
+            if self.source == "live" and self._load_disk_copy() and time.time() - self._loaded_at < CACHE_SECONDS:
+                time.sleep(CACHE_SECONDS - (time.time() - self._loaded_at))
+            while True:
+                self.refresh()
+                time.sleep(CACHE_SECONDS if self._products else 120)
+        threading.Thread(target=loop, daemon=True, name="catalogue-refresh").start()
+
+    def products(self) -> list[Product]:
+        if not self._products and not self._lock.locked():
+            self.refresh()  # first use without a background loader (tests, local runs)
+        return self._products
 
     def get(self, variant_id: int) -> Product | None:
         return next((p for p in self.products() if p.variant_id == int(variant_id)), None)
@@ -206,6 +246,10 @@ class Catalogue:
     def search(self, make: str = "", model: str = "", part: str = "", side: str = "",
                year: int | None = None, part_number: str = "", vin: str = "", limit: int = 3) -> dict:
         prods = self.products()
+        if not prods:
+            return {"found": False, "results": [], "catalogue_unavailable": True,
+                    "note": "Stock list is still loading. Do NOT say the part is out of stock. Keep collecting "
+                            "vehicle/part details and search again in a moment, or hand over if it keeps failing."}
 
         # 1. Part number: exact on normalised tags
         pn = norm_code(part_number)

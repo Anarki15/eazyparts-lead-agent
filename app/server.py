@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 from pathlib import Path
 
 import httpx
@@ -32,13 +33,15 @@ TEST_PAGE_KEY = os.getenv("TEST_PAGE_KEY", "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 app = FastAPI(title="eAZyparts lead agent")
 _agent: Agent | None = None
+_agent_lock = threading.Lock()
 
 
 def agent() -> Agent:
     global _agent
-    if _agent is None:
-        _agent = Agent()
-    return _agent
+    with _agent_lock:
+        if _agent is None:
+            _agent = Agent()
+        return _agent
 
 
 # ---------- lead-form memory (phone -> what they filled in) ----------
@@ -58,16 +61,8 @@ def sa_phone(raw: str) -> str:
 
 @app.on_event("startup")
 def warm_catalogue():
-    """Load the Shopify catalogue in the background so the first customer doesn't wait."""
-    import threading
-    threading.Thread(target=lambda: _safe_warm(), daemon=True).start()
-
-
-def _safe_warm():
-    try:
-        agent().catalogue.products()
-    except Exception as e:  # noqa: BLE001 - log and carry on; next search retries
-        print("catalogue warm-up failed:", e, flush=True)
+    """Load the Shopify catalogue in the background and keep it fresh, so customers never wait for it."""
+    agent().catalogue.start_background_refresh()
 
 
 @app.get("/health")
