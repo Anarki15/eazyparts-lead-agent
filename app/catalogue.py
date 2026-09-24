@@ -11,14 +11,17 @@ Matching order, strongest first:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 
+log = logging.getLogger("eazyparts.catalogue")
 STORE_URL = os.getenv("SHOPIFY_STORE_URL", "https://www.eazyparts.co.za").rstrip("/")
 SAMPLE_FILE = Path(__file__).resolve().parent.parent / "data" / "sample_products.json"
 CACHE_SECONDS = int(os.getenv("CATALOGUE_CACHE_SECONDS", "1800"))
@@ -126,20 +129,33 @@ class Product:
 
 class Catalogue:
     def __init__(self, source: str | None = None):
-        # source: "live" (default when SHOPIFY_STORE_URL set) or "sample"
+        # source: "live" (read the Shopify store) or "sample" (21 test products)
         self.source = source or os.getenv("CATALOGUE_SOURCE", "sample")
         self._products: list[Product] = []
         self._loaded_at = 0.0
+        self._lock = threading.Lock()
+        self.status = {"state": "not loaded", "pages": 0, "last_error": None, "load_seconds": None}
 
     # ---------- loading ----------
+    def _get_page(self, c: httpx.Client, page: int) -> list[dict]:
+        for attempt in range(4):
+            r = c.get(f"{STORE_URL}/products.json", params={"limit": 250, "page": page})
+            if r.status_code in (429, 430, 503):  # Shopify throttling: back off and retry
+                time.sleep(2 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r.json().get("products", [])
+        r.raise_for_status()
+        return []
+
     def _fetch_live(self) -> list[dict]:
         out, page = [], 1
-        with httpx.Client(timeout=20, headers={"User-Agent": "eazyparts-lead-agent/1.0"}) as c:
+        with httpx.Client(timeout=30, follow_redirects=True,
+                          headers={"User-Agent": "Mozilla/5.0 (compatible; eazyparts-lead-agent/1.0)"}) as c:
             while True:
-                r = c.get(f"{STORE_URL}/products.json", params={"limit": 250, "page": page})
-                r.raise_for_status()
-                batch = r.json().get("products", [])
+                batch = self._get_page(c, page)
                 out.extend(batch)
+                self.status["pages"] = page
                 if len(batch) < 250 or page >= 100:
                     break
                 page += 1
@@ -148,15 +164,26 @@ class Catalogue:
     def products(self) -> list[Product]:
         if self._products and time.time() - self._loaded_at < CACHE_SECONDS:
             return self._products
-        try:
-            raw = self._fetch_live() if self.source == "live" else json.loads(SAMPLE_FILE.read_text())["products"]
-        except (httpx.HTTPError, ValueError):
-            if self._products:  # store unreachable: keep using the last good copy
+        with self._lock:  # only one load at a time; others wait and reuse it
+            if self._products and time.time() - self._loaded_at < CACHE_SECONDS:
                 return self._products
-            raise
-        self._products = [p for p in (Product.from_shopify(x) for x in raw) if p and p.available]
-        self._loaded_at = time.time()
-        return self._products
+            t0 = time.time()
+            self.status["state"] = "loading"
+            try:
+                raw = self._fetch_live() if self.source == "live" else json.loads(SAMPLE_FILE.read_text())["products"]
+            except (httpx.HTTPError, ValueError) as e:
+                self.status.update(state="error", last_error=f"{type(e).__name__}: {e}"[:300])
+                log.warning("catalogue load failed: %s", e)
+                if self._products:  # store unreachable: keep using the last good copy
+                    return self._products
+                raise
+            self._products = [p for p in (Product.from_shopify(x) for x in raw) if p and p.available]
+            self._loaded_at = time.time()
+            self.status.update(state="loaded", last_error=None, load_seconds=round(time.time() - t0, 1),
+                               products=len(self._products), raw_products=len(raw))
+            log.info("catalogue loaded: %s sellable of %s products in %ss", len(self._products), len(raw),
+                     self.status["load_seconds"])
+            return self._products
 
     def get(self, variant_id: int) -> Product | None:
         return next((p for p in self.products() if p.variant_id == int(variant_id)), None)
@@ -166,7 +193,7 @@ class Catalogue:
         if self.source != "live":
             return p.available
         try:
-            r = httpx.get(f"{STORE_URL}/products/{p.handle}.js", timeout=10,
+            r = httpx.get(f"{STORE_URL}/products/{p.handle}.js", timeout=10, follow_redirects=True,
                           headers={"User-Agent": "eazyparts-lead-agent/1.0"})
             if r.status_code == 404:
                 return False

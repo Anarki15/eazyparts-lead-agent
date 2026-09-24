@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -28,6 +29,7 @@ WA_TEMPLATE_LANG = os.getenv("WA_TEMPLATE_LANG", "en")
 
 TEST_PAGE_KEY = os.getenv("TEST_PAGE_KEY", "")
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 app = FastAPI(title="eAZyparts lead agent")
 _agent: Agent | None = None
 
@@ -65,14 +67,14 @@ def _safe_warm():
     try:
         agent().catalogue.products()
     except Exception as e:  # noqa: BLE001 - log and carry on; next search retries
-        print("catalogue warm-up failed:", e)
+        print("catalogue warm-up failed:", e, flush=True)
 
 
 @app.get("/health")
 def health():
     cat = agent().catalogue
     return {"ok": True, "agent_enabled": AGENT_ENABLED, "catalogue_source": cat.source,
-            "products_loaded": len(cat._products)}
+            "products_loaded": len(cat._products), "catalogue": cat.status}
 
 
 # ---------- Chatwoot agent bot ----------
