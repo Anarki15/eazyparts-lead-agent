@@ -25,7 +25,7 @@ log = logging.getLogger("eazyparts.catalogue")
 STORE_URL = os.getenv("SHOPIFY_STORE_URL", "https://www.eazyparts.co.za").rstrip("/")
 SAMPLE_FILE = Path(__file__).resolve().parent.parent / "data" / "sample_products.json"
 CACHE_SECONDS = int(os.getenv("CATALOGUE_CACHE_SECONDS", "7200"))
-YEAR_WINDOW = 3
+YEAR_WINDOW = 2  # lights and panels often fit 2 years either side
 KEEP_FIELDS = ("id", "title", "handle", "product_type", "vendor", "tags", "variants", "images")
 PAGE_PAUSE = float(os.getenv("CATALOGUE_PAGE_PAUSE", "2"))
 CACHE_FILE = Path(os.getenv("CATALOGUE_CACHE_FILE", Path(os.getenv("AGENT_DB", "data/x")).parent / "catalogue_cache.json"))
@@ -276,12 +276,22 @@ class Catalogue:
             return True  # can't check right now; Shopify checkout still blocks sold-out items
 
     # ---------- search ----------
+    def find(self, ref) -> "Product | None":
+        """Look up one product by variant id, product handle, or a product link the customer pasted."""
+        ref = str(ref or "").strip()
+        if ref.isdigit():
+            return self.get(int(ref)) or next((p for p in self.products() if p.id == int(ref)), None)
+        m = re.search(r"/products/([^/?#\s]+)", ref)
+        handle = (m.group(1) if m else ref).lower()
+        return next((p for p in self.products() if p.handle.lower() == handle), None)
+
     def search(self, make: str = "", model: str = "", part: str = "", side: str = "",
                year: int | None = None, part_number: str = "", vin: str = "", chassis: str = "",
-               limit: int = 3) -> dict:
+               limit: int = 5) -> dict:
+        limit = max(1, min(int(limit or 5), 8))
         out = self._search(make, model, part, side, year, part_number, vin, chassis, limit)
-        if not out["found"] and side and not out.get("catalogue_unavailable"):
-            other = self._search(make, model, part, "", year, "", "", chassis, limit)
+        if not out["found"] and side and not out.get("catalogue_unavailable") and not out.get("need"):
+            other = self._search(make, model, part, "", year, "", vin, chassis, limit)
             if other["found"]:
                 out["other_side_or_position"] = other["results"]
                 out["note"] = ("Nothing for the requested side/position, but these fit the same vehicle on another "
@@ -294,21 +304,38 @@ class Catalogue:
             return {"found": False, "results": [], "catalogue_unavailable": True,
                     "note": "Stock list is still loading. Do NOT say the part is out of stock. Keep collecting "
                             "vehicle/part details and search again in a moment, or hand over if it keeps failing."}
+        try:
+            year = int(year) if year else None
+        except (TypeError, ValueError):
+            year = None
 
-        # 1. Part number: exact on normalised tags
+        make_w = words(MAKE_ALIASES.get(apply_synonyms(make), make))
+        want_chassis = chassis_tokens(f"{chassis} {model}")
+        model_w = words(model) - want_chassis  # chassis is checked separately (listings don't always name it)
+
+        def vehicle_ok(p: Product) -> bool:
+            return (not make_w or bool(make_w & p.text_words)) and (not model_w or model_w <= p.text_words)
+
+        # 1. Part number: exact on normalised tags (still must be the customer's make/model if given)
         pn = norm_code(part_number)
         if len(pn) >= 6:
-            hits = [p for p in prods if pn in p.codes]
+            hits = [p for p in prods if pn in p.codes and vehicle_ok(p)]
             if hits:
-                return {"found": True, "results": [p.summary("part number match", "high") for p in hits[:limit]]}
+                return {"found": True, "total_matches": len(hits),
+                        "results": [p.summary("part number match", "high") for p in hits[:limit]]}
+
+        # Everything else needs the vehicle: never fall back to other makes/models.
+        if not make_w or not model_w:
+            return {"found": False, "results": [], "need": "make and model",
+                    "note": "Search needs the make AND model (e.g. Toyota + Fortuner). Read them from the licence "
+                            "disc or ask the customer, then search again. The VIN alone is not enough."}
 
         q_side = words(side) | words(part)
         want_lr = q_side & SIDES
         want_fr = q_side & ENDS
-        make_w = words(MAKE_ALIASES.get(apply_synonyms(make), make))
-        want_chassis = chassis_tokens(f"{chassis} {model}")
-        model_w = words(model) - want_chassis  # chassis is checked separately (listings don't always name it)
         part_w = words(part) - SIDES - ENDS
+        v = norm_code(vin)
+        vin_key = v[:11] if len(v) >= 11 else ""
 
         def side_ok(p: Product) -> bool:
             tw = words(p.title)
@@ -318,49 +345,54 @@ class Catalogue:
                 return False
             return True
 
-        def year_ok(p: Product) -> bool:
+        def year_gap(p: Product):
             if not year or not p.years:
-                return True
-            return any(abs(y - int(year)) <= YEAR_WINDOW for y in p.years)
+                return None
+            return min(abs(y - year) for y in p.years)
 
-        # 2. VIN: first 11 chars vs donor-vehicle tag
-        v = norm_code(vin)
-        if len(v) >= 11:
-            vin_hits = [p for p in prods if v[:11] in p.codes and side_ok(p)]
-            if part_w:
-                vin_hits = [p for p in vin_hits if part_w & p.text_words]
-            if vin_hits:
-                return {"found": True, "results": [p.summary("VIN match (same vehicle type)", "high") for p in vin_hits[:limit]]}
-
-        # 3. Text match: make and model must both hit, then score part words
         scored = []
         for p in prods:
-            if make_w and not (make_w & p.text_words):
+            if not vehicle_ok(p) or not side_ok(p) or chassis_conflict(p.title, want_chassis):
                 continue
-            if model_w and not model_w <= p.text_words:
-                continue
-            if not side_ok(p) or not year_ok(p) or chassis_conflict(p.title, want_chassis):
+            gap = year_gap(p)
+            if gap is not None and gap > YEAR_WINDOW:
                 continue
             part_hits = len(part_w & p.text_words)
             if part_w and part_hits == 0:
                 continue
             coverage = part_hits / max(len(part_w), 1)
-            extras = (words(p.title) & ACCESSORY_WORDS) - part_w
-            score = (coverage * 10 + (1 if year and year in p.years else 0)
-                     + (2 if want_chassis & words(p.title) else 0) - 6 * bool(extras))
-            scored.append((score, coverage, p, bool(extras)))
-        scored.sort(key=lambda t: (-t[0], t[2].price))
+            accessory = bool((words(p.title) & ACCESSORY_WORDS) - part_w)
+            relevance = round(coverage * 10) + (2 if want_chassis & words(p.title) else 0)
+            same_donor = bool(vin_key and vin_key in p.codes)
+            scored.append({"p": p, "rel": relevance, "cov": coverage, "acc": accessory, "gap": gap, "vin": same_donor})
 
-        def summ(score, coverage, p):
-            conf = "medium" if coverage >= 0.99 and score >= 9 else "low"
-            note = "text match" + ("" if not year or year in p.years else f", year not exact (listed {p.years or 'no year'}), confirm fitment")
+        # Most relevant part first; then same donor vehicle (VIN), exact year, closest year, OEM, cheapest.
+        scored.sort(key=lambda d: (-d["rel"], not d["vin"], d["gap"] != 0, d["gap"] if d["gap"] is not None else 9,
+                                   d["p"].origin != "OEM", d["p"].price))
+
+        def summ(d):
+            p, gap = d["p"], d["gap"]
+            if d["vin"]:
+                note, conf = "same donor vehicle type as the customer's VIN", "high"
+            else:
+                conf = "medium" if d["cov"] >= 0.99 else "low"
+                if not year:
+                    note = "make/model match"
+                elif gap == 0:
+                    note = "make/model/year match"
+                elif gap is None:
+                    note = "make/model match, no year on listing: confirm fitment"
+                else:
+                    note = f"make/model match, listed {p.years} (within {YEAR_WINDOW} years): confirm fitment"
             return p.summary(note, conf)
 
-        main = [summ(sc, cov, p) for sc, cov, p, acc in scored if not acc][:limit]
-        related = [summ(sc, cov, p) for sc, cov, p, acc in scored if acc][:limit]
-        out = {"found": bool(main), "results": main}
+        main = [d for d in scored if not d["acc"]]
+        related = [d for d in scored if d["acc"]]
+        out = {"found": bool(main), "total_matches": len(main), "results": [summ(d) for d in main[:limit]]}
+        if len(main) > limit:
+            out["note"] = f"{len(main)} matches; showing the best {limit}. Search again with limit up to 8 if asked for more."
         if related and not main:
-            out["related_items_only"] = related
+            out["related_items_only"] = [summ(d) for d in related[:limit]]
             out["note"] = ("We don't have the part itself, only related items (brackets, units, covers...). "
                            "Treat the part as NOT in stock; mention these only if they could help.")
         return out

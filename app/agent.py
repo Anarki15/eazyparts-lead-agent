@@ -26,7 +26,7 @@ IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "i
 TOOLS = [
     {
         "name": "search_stock",
-        "description": "Search live eAZyparts Shopify stock. Use part_number or vin when known; otherwise make + model + part (+ side, year).",
+        "description": "Search live eAZyparts Shopify stock. ALWAYS pass make + model + part (+ side, year). Add vin and/or part_number when known: they only narrow and rank results, they never replace make/model. Searches 2 years either side of the year given.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -38,13 +38,18 @@ TOOLS = [
                 "side": {"type": "string", "description": "left/right and/or front/rear, if relevant"},
                 "part_number": {"type": "string"},
                 "vin": {"type": "string"},
+                "limit": {"type": "integer", "description": "How many results to show (default 5, max 8)"},
             },
+            "required": ["make", "model", "part"],
         },
     },
     {
         "name": "get_product",
-        "description": "Get full details of one product by variant_id (from search_stock results).",
-        "input_schema": {"type": "object", "properties": {"variant_id": {"type": "integer"}}, "required": ["variant_id"]},
+        "description": "Get one product's details AND see its main photo. Use it when the customer pastes a product link "
+                       "from eazyparts.co.za, and before you say a part looks like the customer's photo.",
+        "input_schema": {"type": "object", "properties": {
+            "variant_id": {"type": "integer", "description": "From search_stock results"},
+            "link": {"type": "string", "description": "A product link or handle, e.g. https://eazyparts.co.za/products/li-636"}}},
     },
     {
         "name": "make_checkout_link",
@@ -129,6 +134,23 @@ class TurnResult:
     lead_note: str = ""
 
 
+_conv_locks: dict[str, threading.Lock] = {}
+_conv_locks_guard = threading.Lock()
+
+
+def conv_lock(conv_id: str) -> threading.Lock:
+    """One lock per chat, so messages sent seconds apart are answered one after the other, never in parallel."""
+    with _conv_locks_guard:
+        return _conv_locks.setdefault(conv_id, threading.Lock())
+
+
+def photo_url(url: str, width: int = 800) -> str:
+    """Ask Shopify's image CDN for a smaller copy (cheaper for the AI to look at)."""
+    if "cdn.shopify.com" not in url:
+        return url
+    return url + ("&" if "?" in url else "?") + f"width={width}"
+
+
 class Agent:
     def __init__(self, client=None, catalogue: Catalogue | None = None, store: Store | None = None,
                  tracker: Tracker | None = None):
@@ -163,8 +185,11 @@ class Agent:
                 self.tracker.stock_search(conv.id, args, out["found"], conv.lead["stock_result"])
             return out
         if name == "get_product":
-            p = self.catalogue.get(args["variant_id"])
-            return p.summary("lookup", "high") | {"tags": p.tags} if p else {"error": "not found"}
+            ref = args.get("variant_id") or args.get("link") or ""
+            p = self.catalogue.find(ref)
+            if not p:
+                return {"error": "Not found or no longer in stock (used parts sell quickly). Say so and offer to search again."}
+            return p.summary("lookup", "high") | {"tags": p.tags, "photo_attached": bool(p.image)}
         if name == "make_checkout_link":
             p = self.catalogue.get(args["variant_id"])
             if not p or not self.catalogue.still_available(p):
@@ -198,6 +223,12 @@ class Agent:
                channel: str = "test", customer_name: str = "", phone: str = "", campaign: str = "",
                context: str = "", images: list[dict] | None = None, account_id: str = "") -> TurnResult:
         """images: [{"data": <base64>, "media_type": "image/jpeg"}] (photos the customer sent)."""
+        with conv_lock(conv_id):
+            return self._handle(conv_id, text, image_urls, channel, customer_name, phone, campaign, context,
+                                images, account_id)
+
+    def _handle(self, conv_id, text, image_urls, channel, customer_name, phone, campaign, context, images,
+                account_id) -> TurnResult:
         conv = self.store.load(conv_id) or Conversation(id=conv_id, channel=channel, customer_name=customer_name,
                                                         phone=phone, campaign=campaign, context=context)
         self.tracker.lead_started(conv_id, channel, customer_name, phone, account_id)
@@ -241,7 +272,10 @@ class Agent:
             tool_results = []
             for tu in tool_uses:
                 out = self._run_tool(conv, tu["name"], tu["input"] or {}, result)
-                tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": json.dumps(out)})
+                content = [{"type": "text", "text": json.dumps(out)}]
+                if tu["name"] == "get_product" and out.get("image"):
+                    content.append({"type": "image", "source": {"type": "url", "url": photo_url(out["image"])}})
+                tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": content})
             conv.messages.append({"role": "user", "content": tool_results})
 
         # Photos are big: once Claude has looked at them, keep only a note in the stored history.
@@ -250,6 +284,11 @@ class Agent:
                 m["content"] = [c if c.get("type") != "image" or c["source"].get("type") != "base64"
                                 else {"type": "text", "text": "[customer photo - already viewed above; details are in your replies/lead card]"}
                                 for c in m["content"]]
+                for c in m["content"]:  # product photos seen via get_product: keep only a note
+                    if c.get("type") == "tool_result" and isinstance(c.get("content"), list):
+                        c["content"] = [x if x.get("type") != "image"
+                                        else {"type": "text", "text": "[product photo - already viewed]"}
+                                        for x in c["content"]]
         self.store.save(conv)
         return result
 
