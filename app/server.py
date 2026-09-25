@@ -17,7 +17,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 
 from .agent import DB_PATH, PHOTO_DIR, Agent, new_conversation_id
-from . import followups
+from . import followups, reactivate
 from .dashboard import render_dashboard, render_lead
 
 AGENT_ENABLED = os.getenv("AGENT_ENABLED", "true").lower() == "true"  # kill switch
@@ -144,6 +144,9 @@ def _process_chatwoot(event: dict):
     if not AGENT_ENABLED:
         _cw(f"{conv_id}/toggle_status", {"status": "open"}, account_id)
         return
+
+    if phone and reactivate.is_stop(event.get("content") or ""):
+        reactivate.record_optout(phone)
 
     context = ""
     if phone:
@@ -318,3 +321,43 @@ def media(lead_id: str, name: str, key: str | None = None):
     if PHOTO_DIR.resolve() not in path.parents or not path.exists():
         raise HTTPException(404)
     return FileResponse(path)
+
+
+# ---------- Old-lead win-back ----------
+@app.get("/reactivate", response_class=HTMLResponse)
+def reactivate_page(key: str | None = None):
+    if (os.getenv("DASHBOARD_KEY") or TEST_PAGE_KEY) and not key:
+        return HTMLResponse(LOGIN_PAGE.replace('action="/test"', 'action="/reactivate"')
+                            .replace("Open test chat", "Open win-back").replace("__MSG__", ""))
+    _dash_key(key)
+    return (Path(__file__).parent / "reactivate_page.html").read_text().replace("__KEY__", json.dumps(key or ""))
+
+
+@app.get("/reactivate/status")
+def reactivate_status(key: str | None = None):
+    _dash_key(key)
+    return reactivate.status()
+
+
+@app.post("/reactivate/send")
+async def reactivate_send(request: Request):
+    body = await request.json()
+    _dash_key(body.get("key"))
+    token = os.getenv("CHATWOOT_API_TOKEN") or CHATWOOT_BOT_TOKEN
+    account_id = os.getenv("CHATWOOT_ACCOUNT_ID", "")
+    if not (token and account_id):
+        raise HTTPException(400, "Set CHATWOOT_API_TOKEN and CHATWOOT_ACCOUNT_ID in Render first.")
+    rows = []
+    for r in body.get("leads") or []:
+        phone = sa_phone(r.get("phone", ""))
+        if re.fullmatch(r"27[6-8]\d{8}", phone) and r.get("part_text") and r.get("price"):
+            rows.append({**r, "phone": phone})
+    test_phone = sa_phone(body.get("test_phone", ""))
+    if body.get("test_phone") and not re.fullmatch(r"27[6-8]\d{8}", test_phone):
+        raise HTTPException(400, "That test number doesn't look like a SA mobile number.")
+    if not rows:
+        raise HTTPException(400, "No valid rows (need phone, part_text and price).")
+    msg = reactivate.start(rows[:1] if test_phone else rows, account_id, token, test_phone)
+    if msg != "started":
+        raise HTTPException(409, msg)
+    return {"ok": True, "queued": 1 if test_phone else len(rows)}

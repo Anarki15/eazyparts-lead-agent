@@ -1,0 +1,55 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Old lead win-back</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--ink:#1d2330;--mute:#667085;--line:#e3e6eb;--go:#008069;--warn:#b54708}
+body{font:15px system-ui,sans-serif;background:var(--bg);color:var(--ink);margin:0;padding:16px}
+main{max-width:1100px;margin:auto;display:grid;gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+h1{font-size:20px;margin:0 0 4px}p{margin:6px 0;color:var(--mute)}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{border-bottom:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}
+th{background:#fafbfc;position:sticky;top:0}.wrap{max-height:420px;overflow:auto}
+button{font:inherit;padding:9px 14px;border-radius:8px;border:0;background:var(--go);color:#fff;cursor:pointer}
+button.sec{background:#fff;color:var(--ink);border:1px solid var(--line)}button:disabled{opacity:.5}
+input[type=text]{font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px;width:180px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.pill{font-size:12px;padding:2px 8px;border-radius:99px;background:#eef}
+pre{background:#0f1720;color:#d6e2f0;padding:10px;border-radius:8px;max-height:260px;overflow:auto;font-size:12px;white-space:pre-wrap}
+.msg{background:#dcf8c6;border-radius:8px;padding:10px;max-width:520px;color:var(--ink)}
+</style></head><body><main>
+<div class="card"><h1>Old lead win-back</h1>
+<p>Upload the win-back CSV, untick anyone you don't want to message, send a test to your own WhatsApp, then send.
+Each customer gets one message. Anyone who replies STOP is never messaged again. Limit: <b id="lim"></b> per 24 hours.</p>
+<div class="row"><input type="file" id="file" accept=".csv"><span id="stats" class="pill"></span></div></div>
+<div class="card"><b>What the customer sees</b><div class="msg" id="preview">Pick a row to preview.</div></div>
+<div class="card"><div class="wrap"><table id="t"><thead><tr><th><input type="checkbox" id="all" checked></th><th>Lead</th><th>Name</th><th>Phone</th>
+<th>Asked for</th><th>We offer</th><th>From</th></tr></thead><tbody></tbody></table></div>
+<div class="row" style="margin-top:12px"><input type="text" id="testphone" placeholder="Your number 082…">
+<button class="sec" id="test">Send test of first ticked row</button><button id="send">Send to ticked customers</button></div></div>
+<div class="card"><b>Send log</b> <span id="sum" class="pill"></span><pre id="log">Nothing sent yet.</pre></div>
+</main><script>
+const KEY=__KEY__;let rows=[];
+const BODY=(r)=>`Hi ${r.name||'there'}, a while ago you asked eAZyparts about a ${r.part_text}. We now have one in stock that may fit, from R${r.price}. Reply YES and we'll confirm it fits your car and send the link. Reply STOP to opt out.`;
+function parseCSV(t){const out=[];let row=[],f='',q=false;for(let i=0;i<t.length;i++){const c=t[i];
+ if(q){if(c=='"'&&t[i+1]=='"'){f+='"';i++}else if(c=='"')q=false;else f+=c}
+ else if(c=='"')q=true;else if(c==','){row.push(f);f=''}else if(c=='\n'||c=='\r'){if(c=='\r'&&t[i+1]=='\n')i++;row.push(f);f='';if(row.some(x=>x))out.push(row);row=[]}else f+=c}
+ if(f||row.length){row.push(f);out.push(row)}const h=out.shift().map(s=>s.trim());return out.map(r=>Object.fromEntries(h.map((k,i)=>[k,(r[i]||'').trim()])))}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function draw(){const tb=document.querySelector('#t tbody');tb.innerHTML=rows.map((r,i)=>`<tr data-i="${i}"><td><input type="checkbox" class="ck" data-i="${i}" ${r._on?'checked':''}></td>
+<td>${esc(r.lead_id)}</td><td>${esc(r.name)}</td><td>…${esc(r.phone.slice(-4))}</td><td>${esc(r.request)}</td><td>${esc(r.product)}</td><td>R${esc(r.price)}</td></tr>`).join('');
+ document.getElementById('stats').textContent=`${rows.filter(r=>r._on).length} of ${rows.length} ticked`}
+document.getElementById('file').onchange=async e=>{rows=parseCSV(await e.target.files[0].text()).map(r=>({...r,_on:true}));draw();if(rows[0])preview(0)};
+function preview(i){document.getElementById('preview').textContent=BODY(rows[i])}
+document.querySelector('#t').addEventListener('click',e=>{const tr=e.target.closest('tr[data-i]');if(!tr)return;const i=+tr.dataset.i;
+ if(e.target.classList.contains('ck')){rows[i]._on=e.target.checked;draw()}preview(i)});
+document.getElementById('all').onchange=e=>{rows.forEach(r=>r._on=e.target.checked);draw()};
+async function post(body){const r=await fetch('/reactivate/send',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({key:KEY,...body})});
+ const j=await r.json().catch(()=>({detail:r.statusText}));if(!r.ok)alert(j.detail||'Failed');poll()}
+document.getElementById('test').onclick=()=>{const r=rows.find(r=>r._on);const p=document.getElementById('testphone').value.trim();
+ if(!r||!p)return alert('Upload the CSV and type your own number first.');post({leads:[r],test_phone:p})};
+document.getElementById('send').onclick=()=>{const sel=rows.filter(r=>r._on);if(!sel.length)return;
+ if(confirm(`Send the WhatsApp message to ${sel.length} customers now? This can't be undone.`))post({leads:sel})};
+async function poll(){const s=await (await fetch('/reactivate/status?key='+encodeURIComponent(KEY))).json();
+ document.getElementById('lim').textContent=s.daily_limit;document.getElementById('log').textContent=s.log.join('\n')||'Nothing sent yet.';
+ document.getElementById('sum').textContent=`${s.total_sent} sent in total · ${s.sent_24h} in last 24h · ${s.optouts} opted out · template ${s.template}`;
+ if(s.running)setTimeout(poll,2500)}
+poll();
+</script></body></html>
