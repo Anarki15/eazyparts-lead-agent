@@ -17,7 +17,7 @@ from .prompt import build_system_prompt
 from .tracking import Tracker
 
 MODEL = os.getenv("AGENT_MODEL", "claude-haiku-4-5")
-MAX_TOOL_ROUNDS = 6
+MAX_TOOL_ROUNDS = 10
 MAX_HISTORY = 40  # messages kept per conversation
 DB_PATH = Path(os.getenv("AGENT_DB", Path(__file__).resolve().parent.parent / "data" / "conversations.db"))
 PHOTO_DIR = DB_PATH.parent / "photos"
@@ -41,6 +41,26 @@ TOOLS = [
                 "limit": {"type": "integer", "description": "How many results to show (default 5, max 8)"},
             },
             "required": ["make", "model", "part"],
+        },
+    },
+    {
+        "name": "search_parts_list",
+        "description": "Search stock for SEVERAL parts for one vehicle in one go (a typed list, or a photo of a parts "
+                       "list / quote / insurer parts order). Returns the best 2 matches per part, or not found.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "make": {"type": "string"}, "model": {"type": "string"}, "year": {"type": "integer"},
+                "chassis": {"type": "string"}, "vin": {"type": "string"},
+                "parts": {"type": "array", "description": "One entry per line of the list",
+                          "items": {"type": "object", "properties": {
+                              "part": {"type": "string", "description": "Plain part name, e.g. 'front bumper cover', 'bonnet emblem'"},
+                              "side": {"type": "string", "description": "left/right/front/rear if the line says so (L/F = left front, R/F = right front)"},
+                              "part_number": {"type": "string"},
+                              "list_text": {"type": "string", "description": "The line exactly as written on the list"}},
+                              "required": ["part"]}},
+            },
+            "required": ["make", "model", "parts"],
         },
     },
     {
@@ -190,6 +210,26 @@ class Agent:
             if not out.get("catalogue_unavailable"):
                 self.tracker.stock_search(conv.id, args, out["found"], conv.lead["stock_result"])
             return out
+        if name == "search_parts_list":
+            base = {k: args.get(k) for k in ("make", "model", "year", "chassis", "vin") if args.get(k)}
+            lines, found_titles = [], []
+            for i, it in enumerate(args.get("parts") or [], 1):
+                q = dict(base, part=it.get("part", ""), side=it.get("side", ""), part_number=it.get("part_number", ""), limit=2)
+                r = self.catalogue.search(**{k: v for k, v in q.items() if v not in (None, "")})
+                if r.get("catalogue_unavailable"):
+                    return r
+                slim = lambda x: {k: x[k] for k in ("title", "price_zar", "condition", "origin", "product_url", "variant_id", "match")}
+                line = {"line": i, "asked": it.get("list_text") or " ".join(filter(None, [it.get("side"), it.get("part")])),
+                        "found": r["found"], "options": [slim(x) for x in r["results"]]}
+                if not r["found"] and r.get("other_side_or_position"):
+                    line["other_side_only"] = [slim(x) for x in r["other_side_or_position"][:1]]
+                lines.append(line)
+                if r["found"]:
+                    found_titles.append(r["results"][0]["title"])
+            n_found = sum(1 for l in lines if l["found"])
+            conv.lead["stock_result"] = f"list of {len(lines)}: {n_found} in stock; " + "; ".join(found_titles)[:250]
+            self.tracker.stock_search(conv.id, base | {"part": f"{len(lines)}-part list"}, n_found > 0, conv.lead["stock_result"])
+            return {"summary": f"{n_found} of {len(lines)} parts in stock", "lines": lines}
         if name == "get_product":
             ref = args.get("variant_id") or args.get("link") or ""
             p = self.catalogue.find(ref)
@@ -285,7 +325,7 @@ class Agent:
 
         for _ in range(MAX_TOOL_ROUNDS):
             resp = self.client.messages.create(
-                model=MODEL, max_tokens=800, tools=TOOLS,
+                model=MODEL, max_tokens=2000, tools=TOOLS,
                 system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 messages=trim_history(conv.messages),
             )
