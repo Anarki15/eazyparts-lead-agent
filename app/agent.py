@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .catalogue import Catalogue, checkout_link
+from .catalogue import STORE_URL, Catalogue, checkout_link
 from .leads import format_card, save_lead
 from .prompt import build_system_prompt
 from .tracking import Tracker
@@ -53,11 +53,17 @@ TOOLS = [
     },
     {
         "name": "make_checkout_link",
-        "description": "Create a checkout link for the product the customer chose. Shipping is chosen at checkout.",
+        "description": "Create ONE checkout link for everything the customer chose. For several parts, put every part in "
+                       "items so they all land in the same cart. Shipping is chosen at checkout.",
         "input_schema": {
             "type": "object",
-            "properties": {"variant_id": {"type": "integer"}, "quantity": {"type": "integer", "default": 1}},
-            "required": ["variant_id"],
+            "properties": {
+                "items": {"type": "array", "description": "Every part the customer wants to buy",
+                          "items": {"type": "object", "properties": {
+                              "variant_id": {"type": "integer"}, "quantity": {"type": "integer", "default": 1}},
+                              "required": ["variant_id"]}},
+                "variant_id": {"type": "integer", "description": "Shortcut for a single part"},
+                "quantity": {"type": "integer", "default": 1}},
         },
     },
     {
@@ -191,14 +197,37 @@ class Agent:
                 return {"error": "Not found or no longer in stock (used parts sell quickly). Say so and offer to search again."}
             return p.summary("lookup", "high") | {"tags": p.tags, "photo_attached": bool(p.image)}
         if name == "make_checkout_link":
-            p = self.catalogue.get(args["variant_id"])
-            if not p or not self.catalogue.still_available(p):
-                return {"error": "That product has just sold out. Apologise, then offer to search again or start a sourcing request."}
+            wanted = list(args.get("items") or [])
+            if args.get("variant_id"):
+                wanted.append({"variant_id": args["variant_id"], "quantity": args.get("quantity", 1)})
+            lines, sold_out, seen = [], [], set()
+            for it in wanted:
+                vid = int(it.get("variant_id") or 0)
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                p = self.catalogue.get(vid)
+                if not p or not self.catalogue.still_available(p):
+                    sold_out.append(p.title if p else str(vid))
+                    continue
+                lines.append((p, max(1, int(it.get("quantity") or 1))))
+            if not lines:
+                return {"error": "Sold out: " + ", ".join(sold_out) + ". Apologise, then offer to search again or start a sourcing request."}
             conv.lead["outcome"] = "checkout link sent"
-            url = checkout_link(p.variant_id, args.get("quantity", 1), conv.id)
-            self.tracker.checkout_sent(conv.id, p.title, url, p.variant_id)
-            return {"checkout_url": url, "title": p.title,
-                    "price_zar": p.price, "note": "Delivery calculated at checkout, or collect in Bloemfontein."}
+            if len(lines) == 1:
+                url = checkout_link(lines[0][0].variant_id, lines[0][1], conv.id)
+            else:
+                cart = ",".join(f"{p.variant_id}:{q}" for p, q in lines)
+                url = f"{STORE_URL}/cart/{cart}?attributes[lead_id]={conv.id}&ref=wa-agent"
+            for p, q in lines:
+                self.tracker.checkout_sent(conv.id, " + ".join(x.title for x, _ in lines), url, p.variant_id)
+            out = {"checkout_url": url,
+                   "items": [{"title": p.title, "quantity": q, "price_zar": p.price} for p, q in lines],
+                   "total_zar": round(sum(p.price * q for p, q in lines), 2),
+                   "note": "All items are in this one link. Delivery calculated at checkout, or collect in Bloemfontein."}
+            if sold_out:
+                out["sold_out_not_included"] = sold_out
+            return out
         if name == "save_lead_card":
             conv.lead.update({k: v for k, v in args.items() if v})
             return {"ok": True}
