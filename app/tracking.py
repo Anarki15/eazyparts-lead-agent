@@ -25,6 +25,9 @@ EXTRA_COLUMNS = {
     "nudges": "INTEGER DEFAULT 0", "last_nudge_at": "REAL", "opted_out": "INTEGER DEFAULT 0",
     "account_id": "TEXT DEFAULT ''", "paid_at": "REAL", "order_name": "TEXT DEFAULT ''",
     "order_total": "REAL DEFAULT 0", "checkout_variants": "TEXT DEFAULT '[]'", "checkout_title": "TEXT DEFAULT ''",
+    # Shopify checkout activity (checkout rescue)
+    "checkout_tokens": "TEXT DEFAULT '[]'", "checkout_total": "REAL DEFAULT 0", "checkout_shipping": "REAL DEFAULT 0",
+    "checkout_last_at": "REAL", "rescue_sent": "INTEGER DEFAULT 0", "rescue_kind": "TEXT DEFAULT ''",
 }
 STAGE_RANK = {s: i for i, (s, _) in enumerate(STAGES)}
 STAFF_STATUSES = ["New", "Contacted", "Quoted", "Won", "Lost"]
@@ -124,27 +127,30 @@ class Tracker:
         self._ensure(lead_id, nudges=(row["nudges"] or 0) + 1, last_nudge_at=time.time(), last_agent_at=time.time())
         self.event(lead_id, "nudge", text[:1000])
 
-    def order_paid(self, order: dict) -> str | None:
-        """Match a Shopify order to a lead: lead_id cart attribute first, then phone, then product sent in chat."""
+    def match_lead(self, order: dict) -> str | None:
+        """Find the chat behind a Shopify order or checkout: lead_id cart attribute, then phone, then product sent."""
         attrs = {a.get("name"): a.get("value") for a in order.get("note_attributes") or []}
         lead_id = attrs.get("lead_id")
-        if not (lead_id and self.get(lead_id)):
-            lead_id = None
-            phones = {re.sub(r"\D", "", p or "")[-9:] for p in (
-                order.get("phone"), (order.get("customer") or {}).get("phone"),
-                (order.get("billing_address") or {}).get("phone"), (order.get("shipping_address") or {}).get("phone"))
-                if p and len(re.sub(r"\D", "", p)) >= 9}
-            variants = {li.get("variant_id") for li in order.get("line_items") or []}
-            since = time.time() - 14 * 86400
-            for r in self.leads_since(since):
-                if r["paid_at"]:
-                    continue
-                if phones and r["phone"] and r["phone"][-9:] in phones:
-                    lead_id = r["id"]
-                    break
-                if variants & set(json.loads(r["checkout_variants"] or "[]")):
-                    lead_id = r["id"]
-                    break
+        if lead_id and self.get(lead_id):
+            return lead_id
+        phones = {re.sub(r"\D", "", p or "")[-9:] for p in (
+            order.get("phone"), (order.get("customer") or {}).get("phone"),
+            (order.get("billing_address") or {}).get("phone"), (order.get("shipping_address") or {}).get("phone"))
+            if p and len(re.sub(r"\D", "", p)) >= 9}
+        variants = {li.get("variant_id") for li in order.get("line_items") or []}
+        since = time.time() - 14 * 86400
+        for r in self.leads_since(since):
+            if r["paid_at"]:
+                continue
+            if phones and r["phone"] and r["phone"][-9:] in phones:
+                return r["id"]
+            if variants & set(json.loads(r["checkout_variants"] or "[]")):
+                return r["id"]
+        return None
+
+    def order_paid(self, order: dict) -> str | None:
+        """Match a Shopify order to a lead: lead_id cart attribute first, then phone, then product sent in chat."""
+        lead_id = self.match_lead(order)
         if not lead_id:
             return None
         self._ensure(lead_id, paid_at=time.time(), order_name=str(order.get("name") or order.get("order_number") or ""),
@@ -153,6 +159,61 @@ class Tracker:
         self.advance(lead_id, "paid")
         return lead_id
 
+    def checkout_activity(self, checkout: dict) -> str | None:
+        """Shopify 'checkout create/update' webhook: the customer got as far as the payment page.
+
+        Each new checkout token for the same lead counts as another attempt (usually a failed card payment)."""
+        if checkout.get("completed_at"):
+            return None  # it became an order; orders/paid handles it
+        lead_id = self.match_lead(checkout)
+        row = self.get(lead_id) if lead_id else None
+        if not row or row["paid_at"]:
+            return None
+        tokens = json.loads(row["checkout_tokens"] or "[]")
+        token = str(checkout.get("token") or checkout.get("id") or "")
+        new_attempt = bool(token) and token not in tokens
+        if new_attempt:
+            tokens.append(token)
+        shipping = sum(float(s.get("price") or 0) for s in checkout.get("shipping_lines") or [])
+        total = float(checkout.get("total_price") or 0)
+        fields = {"checkout_tokens": json.dumps(tokens[-10:]), "checkout_last_at": time.time()}
+        if total:
+            fields["checkout_total"] = total
+        if shipping:
+            fields["checkout_shipping"] = shipping
+        self._ensure(lead_id, **fields)
+        if new_attempt:
+            self.event(lead_id, "checkout_started", {"token": token[-8:], "total": total, "shipping": shipping,
+                                                     "attempt": len(tokens)})
+        return lead_id
+
+    def due_for_rescue(self, after_min: float = 45, window_h: float = 23.5):
+        """Leads that reached Shopify's checkout, didn't pay, and went quiet. One rescue message each."""
+        now = time.time()
+        out = []
+        for r in self.leads_since(now - 3 * 86400):
+            if (r["handed_over"] or r["opted_out"] or r["paid_at"] or r["rescue_sent"]
+                    or not r["checkout_last_at"] or not r["id"].startswith("cw-")):
+                continue
+            last_c = r["last_customer_at"] or 0
+            if not last_c or now - last_c >= window_h * 3600:
+                continue  # outside WhatsApp's free reply window
+            if last_c > r["checkout_last_at"]:
+                continue  # they messaged after checkout: the agent is already talking to them
+            if now - r["checkout_last_at"] >= after_min * 60:
+                out.append(dict(r))
+        return out
+
+    def rescue_pending(self, lead: dict) -> bool:
+        return bool(lead.get("checkout_last_at")) and not lead.get("rescue_sent") and not lead.get("paid_at")
+
+    def rescue_done(self, lead_id: str, kind: str, text: str):
+        row = self.get(lead_id)
+        # counts as the first follow-up, so at most the 20h "last reminder" can come after it
+        self._ensure(lead_id, rescue_sent=1, rescue_kind=kind, last_agent_at=time.time(), last_nudge_at=time.time(),
+                     nudges=max(1, (row["nudges"] or 0) if row else 0))
+        self.event(lead_id, "rescue", {"kind": kind, "text": text[:1000]})
+
     def due_for_nudge(self, first_after_h: float = 2, second_after_h: float = 20, window_h: float = 23.5):
         """Leads the agent replied to, where the customer went quiet, still inside WhatsApp's 24h reply window."""
         now = time.time()
@@ -160,6 +221,8 @@ class Tracker:
         for r in self.leads_since(now - 3 * 86400):
             if r["handed_over"] or r["opted_out"] or r["paid_at"] or not r["id"].startswith("cw-"):
                 continue
+            if self.rescue_pending(dict(r)):
+                continue  # they reached checkout: the targeted rescue message goes instead of a generic nudge
             last_c, last_a = r["last_customer_at"] or 0, r["last_agent_at"] or 0
             if not last_c or last_a <= last_c:
                 continue  # customer spoke last: the agent is answering, nothing to chase
@@ -239,6 +302,8 @@ class Tracker:
                 "paid_orders": sum(1 for r in rows if r["paid_at"]),
                 "revenue": round(sum(r["order_total"] or 0 for r in rows if r["paid_at"]), 2),
                 "nudges": sum(r["nudges"] or 0 for r in rows),
+                "rescues": sum(1 for r in rows if r["rescue_sent"]),
+                "rescued": sum(1 for r in rows if r["rescue_sent"] and r["paid_at"]),
                 "won": sum(1 for r in rows if r["staff_status"] == "Won"),
                 "lost": sum(1 for r in rows if r["staff_status"] == "Lost"),
                 "recent": [dict(r) for r in rows[:50]]}

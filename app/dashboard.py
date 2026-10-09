@@ -82,6 +82,7 @@ def render_dashboard(t: Tracker, key: str, days: int = 7) -> str:
         (s["paid_orders"], "paid orders"),
         (f'R{s["revenue"]:,.0f}', "sales from agent chats"),
         (s["nudges"], "automatic follow-ups sent"),
+        (f'{s.get("rescued", 0)} / {s.get("rescues", 0)}', "checkout rescues that paid"),
         (f'{s["won"]} / {s["lost"]}', "won / lost (staff)"),
     ]
     tiles_html = "".join(f'<div class="tile"><b>{v}</b><span>{_e(lbl)}</span></div>' for v, lbl in tiles)

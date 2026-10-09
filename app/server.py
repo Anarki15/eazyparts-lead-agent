@@ -69,7 +69,7 @@ def warm_catalogue():
     """Load the Shopify catalogue in the background and keep it fresh, so customers never wait for it."""
     agent().catalogue.start_background_refresh()
     if CHATWOOT_BOT_TOKEN:
-        followups.start_loop(agent(), _send_followup)
+        followups.start_loop(agent(), _send_followup, _escalate_to_staff)
 
 
 def _send_followup(lead: dict, text: str) -> bool:
@@ -79,6 +79,18 @@ def _send_followup(lead: dict, text: str) -> bool:
         return False
     r = _cw(f"{conv_id}/messages", {"content": text, "message_type": "outgoing", "private": False}, account_id)
     return r is not None and r.status_code < 300
+
+
+def _escalate_to_staff(lead: dict, note: str):
+    """Hand a chat to staff: private note, labels, high priority, open (the bot stops replying)."""
+    account_id = lead.get("account_id") or os.getenv("CHATWOOT_ACCOUNT_ID", "")
+    conv_id = lead["id"].removeprefix("cw-")
+    if not account_id:
+        return
+    _cw(f"{conv_id}/messages", {"content": note, "message_type": "outgoing", "private": True}, account_id)
+    _cw(f"{conv_id}/labels", {"labels": ["checkout-rescue", "needs-human", "via-agent"]}, account_id)
+    _cw(f"{conv_id}/toggle_priority", {"priority": "high"}, account_id)
+    _cw(f"{conv_id}/toggle_status", {"status": "open"}, account_id)
 
 
 @app.get("/health")
@@ -271,15 +283,32 @@ def test_page(key: str | None = None):
 SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
 
 
-@app.post("/webhooks/shopify-orders")
-async def shopify_orders(request: Request):
-    """Shopify Admin > Settings > Notifications > Webhooks > 'Order payment' (JSON) -> this URL."""
+async def _shopify_body(request: Request) -> dict:
     raw = await request.body()
     if SHOPIFY_WEBHOOK_SECRET:
         digest = base64.b64encode(hmac.new(SHOPIFY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).digest()).decode()
         if not hmac.compare_digest(digest, request.headers.get("X-Shopify-Hmac-Sha256", "")):
             raise HTTPException(401)
-    order = json.loads(raw or b"{}")
+    return json.loads(raw or b"{}")
+
+
+@app.post("/webhooks/shopify-checkouts")
+async def shopify_checkouts(request: Request):
+    """Shopify Admin > Settings > Notifications > Webhooks > 'Checkout creation' AND 'Checkout update' (JSON).
+
+    Tells the agent a customer reached the payment page, how many attempts, and what courier cost they saw."""
+    checkout = await _shopify_body(request)
+    lead_id = agent().tracker.checkout_activity(checkout)
+    if lead_id:
+        logging.getLogger("eazyparts").info("Shopify checkout %s matched lead %s",
+                                            str(checkout.get("token", ""))[-8:], lead_id)
+    return {"ok": True, "lead": lead_id}
+
+
+@app.post("/webhooks/shopify-orders")
+async def shopify_orders(request: Request):
+    """Shopify Admin > Settings > Notifications > Webhooks > 'Order payment' (JSON) -> this URL."""
+    order = await _shopify_body(request)
     lead_id = agent().tracker.order_paid(order)
     logging.getLogger("eazyparts").info("Shopify order %s matched lead %s", order.get("name"), lead_id)
     return {"ok": True, "lead": lead_id}
