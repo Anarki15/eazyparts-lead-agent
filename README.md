@@ -70,4 +70,9 @@ function doPost(e) {
 
 - Stock search reads the public `/products.json` feed and caches it for 30 minutes (about 4,800 products = 20 pages), and re-checks the one product live before sending a checkout link. For a very large catalogue, swap in the Shopify Storefront API search. Only `catalogue.py` needs to change.
 - Checkout links are Shopify cart permalinks (`/cart/{variant}:1`) tagged with the lead ID, so orders can be traced back to chats.
-- 2-hour and 24-hour unpaid reminders are not built yet. Add them as a scheduled job once the phase 1 numbers are in.
+- **Follow-ups** (`app/followups.py`): customers who go quiet get a nudge after 2 hours and a last reminder after 20 hours, inside WhatsApp's free 24-hour window, 07:30-20:00 SAST only, max 15 messages per 10-minute run (no morning burst).
+- **Checkout rescue:** add two Shopify webhooks (Settings → Notifications → Webhooks, JSON, same signing secret as the order webhook): *Checkout creation* and *Checkout update* → `https://<render-url>/webhooks/shopify-checkouts`. When a chat customer reaches checkout but doesn't pay, 45 minutes later they get ONE message aimed at the reason instead of the generic nudge:
+  - 2+ checkout attempts (card declined) → EFT / PayJustNow / pay on collection, chat handed to staff (label `checkout-rescue`, high priority).
+  - Courier ≥ R500 and ≥ 40% of the part price → freight quote or collection, handed to staff.
+  - Anything else → "did something go wrong?", the agent keeps handling the chat.
+  Switch off with `CHECKOUT_RESCUE_ENABLED=false`. Tune with `RESCUE_AFTER_MINUTES`, `SHIPPING_SHOCK_RAND`, `SHIPPING_SHOCK_SHARE`, `FOLLOWUP_MAX_PER_RUN`, `PAYMENT_OPTIONS`.
