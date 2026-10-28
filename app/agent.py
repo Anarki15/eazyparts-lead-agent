@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -22,6 +23,43 @@ MAX_HISTORY = 40  # messages kept per conversation
 DB_PATH = Path(os.getenv("AGENT_DB", Path(__file__).resolve().parent.parent / "data" / "conversations.db"))
 PHOTO_DIR = DB_PATH.parent / "photos"
 IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
+PHOTO_KEEP_DAYS = float(os.getenv("PHOTO_KEEP_DAYS", "30"))
+log = logging.getLogger("eazyparts.agent")
+
+
+def _safe(fn, *args, **kwargs):
+    """Run a record-keeping call; log and carry on if it fails (e.g. disk full) instead of dropping the reply."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        log.error("%s failed (customer still gets a reply): %s", getattr(fn, "__name__", fn), e)
+        return None
+
+
+def cleanup_photos(keep_days: float = PHOTO_KEEP_DAYS, root: Path | None = None) -> int:
+    """Delete customer photo copies older than keep_days. They are only for the staff dashboard; the originals
+    stay in Chatwoot. Without this the 1 GB disk filled up (28 Oct 2026). Returns the number of files removed."""
+    root = root or PHOTO_DIR
+    if keep_days <= 0 or not root.exists():
+        return 0
+    cutoff = time.time() - keep_days * 86400
+    removed = 0
+    for f in root.glob("*/*"):
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError as e:
+            log.warning("could not delete old photo %s: %s", f, e)
+    for d in root.iterdir():
+        try:
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+    if removed:
+        log.info("deleted %s customer photos older than %s days", removed, keep_days)
+    return removed
 
 TOOLS = [
     {
@@ -208,7 +246,7 @@ class Agent:
                 "; ".join(r["title"] for r in out["results"]) if out["found"] else f"no match for {args}"
             )
             if not out.get("catalogue_unavailable"):
-                self.tracker.stock_search(conv.id, args, out["found"], conv.lead["stock_result"])
+                _safe(self.tracker.stock_search, conv.id, args, out["found"], conv.lead["stock_result"])
             return out
         if name == "search_parts_list":
             base = {k: args.get(k) for k in ("make", "model", "year", "chassis", "vin") if args.get(k)}
@@ -228,7 +266,7 @@ class Agent:
                     found_titles.append(r["results"][0]["title"])
             n_found = sum(1 for l in lines if l["found"])
             conv.lead["stock_result"] = f"list of {len(lines)}: {n_found} in stock; " + "; ".join(found_titles)[:250]
-            self.tracker.stock_search(conv.id, base | {"part": f"{len(lines)}-part list"}, n_found > 0, conv.lead["stock_result"])
+            _safe(self.tracker.stock_search, conv.id, base | {"part": f"{len(lines)}-part list"}, n_found > 0, conv.lead["stock_result"])
             return {"summary": f"{n_found} of {len(lines)} parts in stock", "lines": lines}
         if name == "get_product":
             ref = args.get("variant_id") or args.get("link") or ""
@@ -260,7 +298,7 @@ class Agent:
                 cart = ",".join(f"{p.variant_id}:{q}" for p, q in lines)
                 url = f"{STORE_URL}/cart/{cart}?attributes[lead_id]={conv.id}&ref=wa-agent"
             for p, q in lines:
-                self.tracker.checkout_sent(conv.id, " + ".join(x.title for x, _ in lines), url, p.variant_id)
+                _safe(self.tracker.checkout_sent, conv.id, " + ".join(x.title for x, _ in lines), url, p.variant_id)
             out = {"checkout_url": url,
                    "items": [{"title": p.title, "quantity": q, "price_zar": p.price} for p, q in lines],
                    "total_zar": round(sum(p.price * q for p, q in lines), 2),
@@ -283,7 +321,7 @@ class Agent:
                     "outcome": conv.lead.get("outcome") or ("sourcing request" if "sourcing" in args["reason"] else "handover")}
             saved = save_lead(card)
             result.lead_note = format_card(saved["row"])
-            self.tracker.handed_over(conv.id, args["reason"], args["priority"], card)
+            _safe(self.tracker.handed_over, conv.id, args["reason"], args["priority"], card)
             return {"ok": True, "google_sheet": saved["google_sheet"]}
         return {"error": f"unknown tool {name}"}
 
@@ -300,10 +338,15 @@ class Agent:
                 account_id) -> TurnResult:
         conv = self.store.load(conv_id) or Conversation(id=conv_id, channel=channel, customer_name=customer_name,
                                                         phone=phone, campaign=campaign, context=context)
-        self.tracker.lead_started(conv_id, channel, customer_name, phone, account_id)
-        photo_names = [self.save_photo(conv_id, im["data"], im.get("media_type", "image/jpeg"))
-                       for im in images or []]
-        self.tracker.customer_message(conv_id, text, photo_names)
+        # Record-keeping (tracking DB, photo copies) must never stop the customer getting an answer:
+        # on 28 Oct 2026 a full disk made every one of these writes fail and the bot went silent.
+        _safe(self.tracker.lead_started, conv_id, channel, customer_name, phone, account_id)
+        photo_names = []
+        for im in images or []:
+            name = _safe(self.save_photo, conv_id, im["data"], im.get("media_type", "image/jpeg"))
+            if name:
+                photo_names.append(name)
+        _safe(self.tracker.customer_message, conv_id, text, photo_names)
         if conv.handed_over:
             return TurnResult(replies=[], handed_over=True)  # staff are handling it
 
@@ -334,7 +377,7 @@ class Agent:
             texts = [b["text"] for b in blocks if b["type"] == "text" and b["text"].strip()]
             result.replies.extend(texts)
             for t in texts:
-                self.tracker.agent_message(conv.id, t)
+                _safe(self.tracker.agent_message, conv.id, t)
             tool_uses = [b for b in blocks if b["type"] == "tool_use"]
             if not tool_uses:
                 break
@@ -358,7 +401,7 @@ class Agent:
                         c["content"] = [x if x.get("type") != "image"
                                         else {"type": "text", "text": "[product photo - already viewed]"}
                                         for x in c["content"]]
-        self.store.save(conv)
+        _safe(self.store.save, conv)
         return result
 
 
@@ -372,7 +415,7 @@ class Agent:
             conv.messages[-1]["content"].append(block)
         else:
             conv.messages.append({"role": "assistant", "content": [block]})
-        self.store.save(conv)
+        _safe(self.store.save, conv)
 
 
 def trim_history(messages: list) -> list:

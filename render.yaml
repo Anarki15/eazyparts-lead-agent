@@ -10,7 +10,7 @@ services:
     disk:
       name: data
       mountPath: /var/data
-      sizeGB: 1
+      sizeGB: 5
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
