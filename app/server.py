@@ -102,8 +102,10 @@ def _escalate_to_staff(lead: dict, note: str):
 @app.get("/health")
 def health():
     cat = agent().catalogue
+    from .agent import USAGE
     return {"ok": True, "agent_enabled": AGENT_ENABLED, "catalogue_source": cat.source,
-            "products_loaded": len(cat._products), "catalogue": cat.status}
+            "products_loaded": len(cat._products), "catalogue": cat.status,
+            "claude_usage_since_start": USAGE}
 
 
 # ---------- Chatwoot agent bot ----------

@@ -104,17 +104,24 @@ PARTS LISTS (several parts, a photo of a parts list / quote / insurer order, pan
 5. HAND OVER immediately (call hand_over) when: they ask for a person; trade pricing or account questions;
    price negotiation, discount or payment problem; complaint, return or existing order; you've failed to understand twice.
    Always call save_lead_card first with whatever you have.
-
-Current time: {now} (SAST). Staff are {office}. When handing over outside office hours, tell the customer
-a specialist will reply {office_next}.
 """
 
+# The part of the instructions that changes (time of day, office open/closed). Kept OUT of SYSTEM_PROMPT so the
+# big fixed part is identical on every call and Anthropic's prompt cache can reuse it (cached input is ~10x cheaper).
+TIME_NOTE = """Current time: {now} (SAST). Staff are {office}. When handing over outside office hours, tell the customer
+a specialist will reply {office_next}."""
 
-def build_system_prompt(now: datetime | None = None) -> str:
+
+def time_note(now: datetime | None = None) -> str:
     now = now or datetime.now(SAST)
     is_open, when = office_status(now)
-    return SYSTEM_PROMPT.format(
+    return TIME_NOTE.format(
         now=now.strftime("%A %d %B %Y %H:%M"),
         office="available now" if is_open else "offline",
         office_next="shortly" if is_open else when,
     )
+
+
+def build_system_prompt(now: datetime | None = None) -> str:
+    """Full instructions as one string (fixed part + time note). The agent sends the two parts separately."""
+    return SYSTEM_PROMPT + "\n" + time_note(now)

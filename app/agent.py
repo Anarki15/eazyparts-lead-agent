@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .catalogue import STORE_URL, Catalogue, checkout_link
 from .leads import format_card, save_lead
-from .prompt import build_system_prompt
+from .prompt import SYSTEM_PROMPT, time_note
 from .tracking import Tracker, is_opt_out_reason
 
 MODEL = os.getenv("AGENT_MODEL", "claude-haiku-4-5")
@@ -376,18 +376,22 @@ class Agent:
         conv.messages.append({"role": "user", "content": content})
 
         result = TurnResult(replies=[], opted_out=(said == "decline"))
-        system = build_system_prompt()
+        # The fixed instructions come first and never change, so the prompt cache can reuse them across every
+        # customer. Anything that changes (time, customer name, known context) goes in a second block after them.
+        extra = time_note()
         if conv.customer_name:
-            system += f"\nCustomer name from the platform: {conv.customer_name}."
+            extra += f"\nCustomer name from the platform: {conv.customer_name}."
         if conv.context:
-            system += f"\nAlready known about this lead (don't re-ask): {conv.context}"
+            extra += f"\nAlready known about this lead (don't re-ask): {conv.context}"
+        system = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+                  {"type": "text", "text": extra}]
 
         for _ in range(MAX_TOOL_ROUNDS):
             resp = self.client.messages.create(
-                model=MODEL, max_tokens=2000, tools=TOOLS,
-                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                messages=trim_history(conv.messages),
+                model=MODEL, max_tokens=2000, tools=TOOLS, system=system,
+                messages=with_cache_point(trim_history(conv.messages)),
             )
+            log_usage(conv.id, getattr(resp, "usage", None))
             blocks = [b.model_dump(exclude_none=True) if hasattr(b, "model_dump") else b for b in resp.content]
             conv.messages.append({"role": "assistant", "content": blocks})
             texts = [b["text"] for b in blocks if b["type"] == "text" and b["text"].strip()]
@@ -432,6 +436,46 @@ class Agent:
         else:
             conv.messages.append({"role": "assistant", "content": [block]})
         _safe(self.store.save, conv)
+
+
+def with_cache_point(messages: list) -> list:
+    """Mark the end of the conversation so far as cacheable. The next tool round (and the customer's next message)
+    then re-reads the whole history from cache instead of paying full price for it again. Returns a copy."""
+    if not messages:
+        return messages
+    out = list(messages)
+    last = dict(out[-1])
+    content = last["content"]
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    content = [dict(b) for b in content]
+    if content:
+        content[-1]["cache_control"] = {"type": "ephemeral"}
+    last["content"] = content
+    out[-1] = last
+    return out
+
+
+# Running token totals since the server started, so the cost is visible in the logs.
+USAGE = {"calls": 0, "input": 0, "cache_write": 0, "cache_read": 0, "output": 0}
+_usage_lock = threading.Lock()
+
+
+def log_usage(conv_id: str, usage) -> None:
+    if usage is None:
+        return
+    get = (lambda k: (usage.get(k) if isinstance(usage, dict) else getattr(usage, k, 0)) or 0)
+    u = {"input": get("input_tokens"), "cache_write": get("cache_creation_input_tokens"),
+         "cache_read": get("cache_read_input_tokens"), "output": get("output_tokens")}
+    with _usage_lock:
+        USAGE["calls"] += 1
+        for k, v in u.items():
+            USAGE[k] += v
+        calls = USAGE["calls"]
+    log.info("claude usage %s: in=%s cache_write=%s cache_read=%s out=%s", conv_id, u["input"], u["cache_write"],
+             u["cache_read"], u["output"])
+    if calls % 50 == 0:
+        log.info("claude usage totals since start: %s", USAGE)
 
 
 def trim_history(messages: list) -> list:

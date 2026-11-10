@@ -85,3 +85,30 @@ def test_photo_cleanup_removes_only_old_photos():
     assert cleanup_photos(30, root) == 1
     assert not old.exists() and new.exists()
     assert not (root / "cw-1").exists()  # empty folder tidied away
+
+
+def test_fixed_instructions_are_cacheable_and_identical():
+    """The cached system block must be the same on every call (no time/customer inside it), and the history must
+    carry a cache point, otherwise every call pays full price (Nov 2026 credit top-ups)."""
+    calls = []
+
+    class Spy(FakeClaude):
+        def __init__(self, script):
+            super().__init__(script)
+            self.messages = SimpleNamespace(create=lambda **kw: calls.append(kw) or
+                                            SimpleNamespace(content=self.script.pop(0), usage=None))
+
+    store = Store(Path(tempfile.mktemp(suffix=".db")))
+    a = Agent(client=Spy([[tb("Hi Thabo!")], [tb("Hi Lerato!")]]), catalogue=Catalogue("sample"), store=store,
+              tracker=Tracker(Path(tempfile.mktemp(suffix=".db"))))
+    a.handle("cw-1", "hello", customer_name="Thabo")
+    a.handle("cw-2", "hi", customer_name="Lerato")
+    first, second = calls[0]["system"][0], calls[1]["system"][0]
+    assert first == second and "cache_control" in first
+    assert "Current time" not in first["text"] and "Thabo" not in first["text"]
+    assert "Thabo" in calls[0]["system"][1]["text"]
+    last_block = calls[0]["messages"][-1]["content"][-1]
+    assert last_block.get("cache_control") == {"type": "ephemeral"}
+    # the stored history must not keep the cache marker
+    assert all("cache_control" not in b for m in store.load("cw-1").messages
+               for b in (m["content"] if isinstance(m["content"], list) else []))
