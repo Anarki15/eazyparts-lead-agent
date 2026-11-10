@@ -15,7 +15,7 @@ from pathlib import Path
 from .catalogue import STORE_URL, Catalogue, checkout_link
 from .leads import format_card, save_lead
 from .prompt import build_system_prompt
-from .tracking import Tracker
+from .tracking import Tracker, is_opt_out_reason
 
 MODEL = os.getenv("AGENT_MODEL", "claude-haiku-4-5")
 MAX_TOOL_ROUNDS = 10
@@ -196,6 +196,10 @@ class TurnResult:
     handover_reason: str = ""
     priority: str = ""
     lead_note: str = ""
+    opted_out: bool = False  # customer said STOP / not interested: label it, but it's not a job for staff
+
+
+STOP_REPLY = ("No problem, we won't send you any more reminders. If you need a part later, just message us here. 👍")
 
 
 _conv_locks: dict[str, threading.Lock] = {}
@@ -309,6 +313,11 @@ class Agent:
         if name == "save_lead_card":
             conv.lead.update({k: v for k, v in args.items() if v})
             return {"ok": True}
+        if name == "hand_over" and is_opt_out_reason(args.get("reason", "")):
+            # Not a handover: staff have nothing to do, and the agent should still answer if they come back.
+            result.opted_out = True
+            _safe(self.tracker.opted_out, conv.id, args.get("reason") or "opt-out")
+            return {"ok": True, "note": "Reminders are off for this customer. Don't message them again unless they write."}
         if name == "hand_over":
             conv.handed_over = True
             result.handed_over = True
@@ -346,9 +355,16 @@ class Agent:
             name = _safe(self.save_photo, conv_id, im["data"], im.get("media_type", "image/jpeg"))
             if name:
                 photo_names.append(name)
-        _safe(self.tracker.customer_message, conv_id, text, photo_names)
+        said = _safe(self.tracker.customer_message, conv_id, text, photo_names)
         if conv.handed_over:
             return TurnResult(replies=[], handed_over=True)  # staff are handling it
+        if said == "opt-out" and not images:
+            # STOP is handled in code with a fixed reply, so it can't be "confirmed" without actually stopping.
+            conv.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
+            conv.messages.append({"role": "assistant", "content": [{"type": "text", "text": STOP_REPLY}]})
+            _safe(self.tracker.agent_message, conv.id, STOP_REPLY)
+            _safe(self.store.save, conv)
+            return TurnResult(replies=[STOP_REPLY], opted_out=True)
 
         content = []
         for url in image_urls or []:
@@ -359,7 +375,7 @@ class Agent:
         content.append({"type": "text", "text": text or "(customer sent a photo)"})
         conv.messages.append({"role": "user", "content": content})
 
-        result = TurnResult(replies=[])
+        result = TurnResult(replies=[], opted_out=(said == "decline"))
         system = build_system_prompt()
         if conv.customer_name:
             system += f"\nCustomer name from the platform: {conv.customer_name}."

@@ -30,6 +30,49 @@ EXTRA_COLUMNS = {
     "checkout_last_at": "REAL", "rescue_sent": "INTEGER DEFAULT 0", "rescue_kind": "TEXT DEFAULT ''",
 }
 STAGE_RANK = {s: i for i, (s, _) in enumerate(STAGES)}
+
+# ---------- opt-outs and "no thanks" ----------
+# Decided in code, not left to the AI: on 9 Nov 2026 a customer said "Stop", the AI replied "I've stopped
+# following up" without recording it, his reply reset the reminder count, and he kept getting reminders.
+_HARD_STOP = re.compile(
+    r"^(stop|stop it|stop please|please stop|stop now|unsubscribe|opt ?out|stop messaging( me)?|"
+    r"stop sending( me)?( messages| msgs)?|stop texting( me)?|remove me|don'?t (message|contact|text) me( again)?|"
+    r"do not (message|contact|text) me( again)?|leave me alone)$")
+_HARD_STOP_ANYWHERE = re.compile(
+    r"\b(unsubscribe|stop (messaging|sending|texting|contacting) me|don'?t (message|contact|text) me|"
+    r"do not (message|contact|text) me|remove me from|stop spamming|leave me alone)\b")
+_DECLINE = re.compile(
+    r"^((no|nope|nah|naa|nee)( thanks?| thank you| thank u| thanx| thx| tx| dankie| baie dankie)?( (for now|anyway))?|"
+    r"no,? (it'?s|i'?m) (fine|ok|okay|good)|(i'?m )?not interested( anymore| any more)?|not anymore|no longer( needed| interested)?|"
+    r"(i )?(don'?t|do not) (need|want) (it|them|that|one)( anymore| any more)?|no need( anymore)?|"
+    r"(i )?(already|just) (bought|got|found|sorted)( (it|one|them|the part|a part))?( elsewhere)?|"
+    r"(i )?found (it|one) elsewhere|(i'?ll|i will) pass|maybe later|not now|"
+    r"(ok(ay)? )?(no )?thanks?,? (but )?(i'?m )?not interested)$")
+
+
+def is_opt_out_reason(reason: str) -> bool:
+    r = (reason or "").lower()
+    return "opt" in r or "stop" in r or "unsubscrib" in r or "not interested" in r or "declin" in r
+
+
+def _norm(text: str) -> str:
+    t = (text or "").lower().replace("\u2019", "'").strip()
+    t = re.sub(r"[^\w' ,]+", " ", t)  # drop emoji and punctuation
+    return re.sub(r"\s+", " ", t).strip(" ,")
+
+
+def is_opt_out(text: str) -> bool:
+    """The customer asked us to stop messaging them (STOP, unsubscribe, don't contact me...)."""
+    t = _norm(text)
+    return bool(t) and (bool(_HARD_STOP.match(t)) or bool(_HARD_STOP_ANYWHERE.search(t)))
+
+
+def is_decline(text: str) -> bool:
+    """A short, whole-message 'no thanks / not interested / already got one' (not 'No, the left one')."""
+    t = _norm(text)
+    return bool(t) and len(t) <= 60 and bool(_DECLINE.match(t))
+
+
 STAFF_STATUSES = ["New", "Contacted", "Quoted", "Won", "Lost"]
 
 
@@ -86,15 +129,29 @@ class Tracker:
             self._ensure(lead_id, channel=channel, name=name, phone=phone, account_id=str(account_id or ""))
             self.event(lead_id, "started", channel)
 
-    def customer_message(self, lead_id: str, text: str, photos: list[str] | None = None):
+    def customer_message(self, lead_id: str, text: str, photos: list[str] | None = None) -> str:
+        """Records the message. Returns "opt-out" (STOP), "decline" ("no thanks" after an offer) or ""."""
         row = self.get(lead_id)
         n = (row["customer_msgs"] if row else 0) + 1
-        fields = {"last_customer_at": time.time(), "customer_msgs": n, "nudges": 0}  # they're back: reset follow-ups
+        fields = {"last_customer_at": time.time(), "customer_msgs": n}
+        stage = row["stage"] if row else "started"
+        kind = ""
+        if is_opt_out(text):
+            kind = "opt-out"
+        elif is_decline(text) and STAGE_RANK.get(stage, 0) >= STAGE_RANK["found"]:
+            kind = "decline"  # a plain "No" before we offered anything is usually an answer, not a refusal
+        if kind:
+            fields["opted_out"] = 1  # no more automatic reminders, ever, for this chat
+        else:
+            fields["nudges"] = 0  # they're back in the conversation: reset follow-ups
         if photos:
             fields["photos"] = json.dumps(json.loads(row["photos"] or "[]") + photos)
         self._ensure(lead_id, **fields)
         self.event(lead_id, "customer", {"text": text[:500], "photos": photos or []})
+        if kind:
+            self.event(lead_id, "opt_out", {"kind": kind, "text": text[:200]})
         self.advance(lead_id, "engaged")
+        return kind
 
     def agent_message(self, lead_id: str, text: str):
         self._ensure(lead_id, last_agent_at=time.time())
@@ -234,10 +291,33 @@ class Tracker:
                 out.append(dict(r))
         return out
 
+    def opted_out(self, lead_id: str, reason: str = "opt-out"):
+        """Customer doesn't want to hear from us: stop reminders. Not a job for staff, so not a handover."""
+        self._ensure(lead_id, opted_out=1)
+        self.event(lead_id, "opt_out", {"kind": reason})
+
+    def backfill_opt_outs(self, days: float = 3) -> int:
+        """One-off at startup: chats from before this fix where the customer said STOP / no thanks in any message
+        but reminders were never switched off. Returns how many were switched off."""
+        n = 0
+        for r in self.leads_since(time.time() - days * 86400):
+            if r["opted_out"] or r["handed_over"] or r["paid_at"]:
+                continue
+            for ev in self.events(r["id"]):
+                if ev["kind"] != "customer":
+                    continue
+                text = (json.loads(ev["detail"] or "{}") or {}).get("text", "")
+                if is_opt_out(text) or (is_decline(text) and STAGE_RANK.get(r["stage"], 0) >= STAGE_RANK["found"]):
+                    self.opted_out(r["id"], "opt-out (backfill)")
+                    n += 1
+                    break
+        return n
+
     def handed_over(self, lead_id: str, reason: str, priority: str, card: dict):
         sourcing = 1 if "sourcing" in reason.lower() else 0
-        if "opt" in reason.lower() or "stop" in reason.lower():
-            self._ensure(lead_id, opted_out=1)
+        if is_opt_out_reason(reason):
+            self.opted_out(lead_id, reason)
+            return
         vehicle = " ".join(str(card.get(k, "")) for k in ("make", "model", "year")).strip()
         fields = dict(handed_over=1, handover_reason=reason, priority=priority, handed_over_at=time.time(),
                       staff_status="New", sourcing=sourcing)

@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Red
 
 from .agent import DB_PATH, PHOTO_DIR, Agent, new_conversation_id
 from . import followups, reactivate
+from .tracking import is_opt_out
 from .dashboard import render_dashboard, render_lead
 
 AGENT_ENABLED = os.getenv("AGENT_ENABLED", "true").lower() == "true"  # kill switch
@@ -69,6 +70,11 @@ def warm_catalogue():
     """Load the Shopify catalogue in the background and keep it fresh, so customers never wait for it."""
     agent().catalogue.start_background_refresh()
     if CHATWOOT_BOT_TOKEN:
+        try:
+            n = agent().tracker.backfill_opt_outs()
+            logging.getLogger("eazyparts").info("switched off reminders for %s earlier STOP / no-thanks chats", n)
+        except Exception as e:  # noqa: BLE001 - never block startup on this
+            logging.getLogger("eazyparts").warning("opt-out backfill failed: %s", e)
         followups.start_loop(agent(), _send_followup, _escalate_to_staff)
 
 
@@ -157,7 +163,7 @@ def _process_chatwoot(event: dict):
         _cw(f"{conv_id}/toggle_status", {"status": "open"}, account_id)
         return
 
-    if phone and reactivate.is_stop(event.get("content") or ""):
+    if phone and (reactivate.is_stop(event.get("content") or "") or is_opt_out(event.get("content") or "")):
         reactivate.record_optout(phone)
 
     context = ""
@@ -174,6 +180,11 @@ def _process_chatwoot(event: dict):
     )
     for text in res.replies:
         _cw(f"{conv_id}/messages", {"content": text, "message_type": "outgoing", "private": False}, account_id)
+    if res.opted_out and not res.handed_over:
+        # Not a job for staff: tag it so it's searchable, but keep it out of the needs-human queue and
+        # leave it with the bot (pending), so the agent still answers if the customer comes back.
+        _cw(f"{conv_id}/labels", {"labels": ["opted-out", "via-agent"]}, account_id)
+        return
     if res.handed_over:
         if res.lead_note:
             _cw(f"{conv_id}/messages", {"content": res.lead_note, "message_type": "outgoing", "private": True}, account_id)
