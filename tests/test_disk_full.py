@@ -112,3 +112,15 @@ def test_fixed_instructions_are_cacheable_and_identical():
     # the stored history must not keep the cache marker
     assert all("cache_control" not in b for m in store.load("cw-1").messages
                for b in (m["content"] if isinstance(m["content"], list) else []))
+
+
+def test_history_is_capped_and_lead_facts_survive():
+    from app.agent import MAX_HISTORY, lead_note, trim_history
+    assert MAX_HISTORY <= 20
+    msgs = []
+    for i in range(30):
+        msgs.append({"role": "user", "content": [{"type": "text", "text": f"msg {i}"}]})
+        msgs.append({"role": "assistant", "content": [{"type": "text", "text": f"reply {i}"}]})
+    assert len(trim_history(msgs)) <= MAX_HISTORY
+    note = lead_note({"vehicle": "VW Polo 2018", "vin": "AAVZZZ6RZJU000001", "part": "left headlight", "photos": []})
+    assert "VW Polo 2018" in note and "AAVZZZ6RZJU000001" in note and "photos" not in note

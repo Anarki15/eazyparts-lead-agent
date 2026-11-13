@@ -19,7 +19,9 @@ from .tracking import Tracker, is_opt_out_reason
 
 MODEL = os.getenv("AGENT_MODEL", "claude-haiku-4-5")
 MAX_TOOL_ROUNDS = 10
-MAX_HISTORY = 40  # messages kept per conversation
+# Messages of history sent to Claude on each call. Every call re-sends this, so it is the main cost driver
+# (Nov 2026: ~1,700 customer messages/day). Key facts survive trimming via the lead summary (lead_note).
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "16"))
 DB_PATH = Path(os.getenv("AGENT_DB", Path(__file__).resolve().parent.parent / "data" / "conversations.db"))
 PHOTO_DIR = DB_PATH.parent / "photos"
 IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
@@ -383,6 +385,9 @@ class Agent:
             extra += f"\nCustomer name from the platform: {conv.customer_name}."
         if conv.context:
             extra += f"\nAlready known about this lead (don't re-ask): {conv.context}"
+        lead = lead_note(conv.lead)
+        if lead:
+            extra += f"\nCollected so far in this chat (older messages may be trimmed; don't re-ask): {lead}"
         system = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
                   {"type": "text", "text": extra}]
 
@@ -476,6 +481,17 @@ def log_usage(conv_id: str, usage) -> None:
              u["cache_read"], u["output"])
     if calls % 50 == 0:
         log.info("claude usage totals since start: %s", USAGE)
+
+
+def lead_note(lead: dict) -> str:
+    """One-line summary of what the lead card holds, so trimming old messages never loses the vehicle/VIN/part."""
+    parts = []
+    for k, v in (lead or {}).items():
+        if v in (None, "", [], {}):
+            continue
+        v = ", ".join(map(str, v)) if isinstance(v, list) else str(v)
+        parts.append(f"{k}: {v[:200]}")
+    return "; ".join(parts)[:1200]
 
 
 def trim_history(messages: list) -> list:
